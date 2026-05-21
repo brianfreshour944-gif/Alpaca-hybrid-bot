@@ -195,14 +195,14 @@ class AlpacaHybridBot:
             timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
 
             request = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=timeframe,
-                start=start,
-                end=end,
-                limit=limit,
-                adjustment=Adjustment.ALL,
-                feed='iex'   # Required for free tier
-            )
+    symbol_or_symbols=symbol,
+    timeframe=timeframe,
+    start=start,
+    end=end,
+    limit=limit,
+    adjustment=Adjustment.ALL,
+    feed=DataFeed.IEX   # Set to IEX for free tier access
+)
             bars = self.data_client.get_stock_bars(request)
 
             if symbol in bars.data and bars.data[symbol]:
