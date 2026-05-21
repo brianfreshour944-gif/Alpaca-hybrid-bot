@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Hybrid Alpaca Trading Bot - Crypto Version
@@ -235,18 +236,13 @@ class AlpacaHybridBot:
                 logger.error(f"Cannot get price for {symbol}, order aborted.")
                 return None
 
-            # Calculate quantity (fractional)
+            # Calculate quantity (fractional) for logging only
             qty = self.order_size_usd / price
-            # Round to 6 decimals for crypto
             qty = round(qty, 6)
-
-            if qty <= 0:
-                logger.error(f"Calculated quantity too small for {symbol}")
-                return None
 
             order = MarketOrderRequest(
                 symbol=symbol,
-                notional=self.order_size_usd,  # Alternative: use 'notional' for USD amount
+                notional=self.order_size_usd,  # Use notional for USD amount
                 side=side,
                 time_in_force=TimeInForce.GTC
             )
@@ -297,7 +293,7 @@ class AlpacaHybridBot:
                             self.positions[symbol] = {
                                 'price': current_price,
                                 'entry_time': datetime.now().isoformat(),
-                                'order_id': order.id
+                                'order_id': str(order.id)   # ✅ FIX: convert UUID to string
                             }
                             self.save_state()
 
@@ -312,7 +308,8 @@ class AlpacaHybridBot:
                                 'entry_price': entry_price,
                                 'exit_price': current_price,
                                 'pnl_pct': pnl_pct,
-                                'exit_time': datetime.now().isoformat()
+                                'exit_time': datetime.now().isoformat(),
+                                'order_id': str(order.id)   # optional: store as string
                             }
                             self.trades.append(trade_record)
                             del self.positions[symbol]
