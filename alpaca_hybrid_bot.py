@@ -1,20 +1,25 @@
+
 #!/usr/bin/env python3
 """
 Hybrid Alpaca Trading Bot - Mean Reversion + Trend Filter
 Backtest Win Rate: 74.6% | Return: 7.19%
 
-Environment variables required:
+Environment variables:
 - ALPACA_API_KEY
 - ALPACA_SECRET_KEY
-- (Optional) PAPER_MODE = true/false (default true)
+- PAPER_MODE (default true)
+- INTERVAL_MINUTES (default 5)
+- BUY_THRESHOLD (default 0.62)
+- SELL_THRESHOLD (default 0.38)
+- SYMBOLS (comma-separated, default "SPY,QQQ,IWM")
 """
-import Adjustment, Feedimport asyncio
+
+import asyncio
 import logging
 import json
 import os
 import numpy as np
 import pandas as pd
-from alpaca.data.enums
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
 
@@ -23,7 +28,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.enums import Adjustment
+from alpaca.data.enums import Adjustment, Feed   # <-- Fixed import
 from alpaca.data.timeframe import TimeFrame
 
 # Setup logging
@@ -144,9 +149,16 @@ class AlpacaHybridBot:
         self.trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper_mode)
         self.data_client = StockHistoricalDataClient(self.api_key, self.secret_key)
 
-        # Symbols (override via env)
-        symbols_env = os.getenv("SYMBOLS", "SPY,QQQ,IWM")
-        self.symbols = [s.strip() for s in symbols_env.split(",")]
+        # Symbols: parse comma-separated, strip spaces, ignore any extra text (like comments)
+        symbols_raw = os.getenv("SYMBOLS", "SPY,QQQ,IWM")
+        # Split by comma, take the first part before any space or comment
+        self.symbols = []
+        for s in symbols_raw.split(','):
+            s = s.strip().split()[0]  # e.g., "IWM (or add" becomes "IWM"
+            if s and s.isalpha():     # only letters, no parentheses
+                self.symbols.append(s)
+        if not self.symbols:
+            self.symbols = ['SPY', 'QQQ', 'IWM']
 
         self.ml = HybridPredictor()
         self.positions: Dict[str, Dict] = {}
@@ -182,15 +194,15 @@ class AlpacaHybridBot:
             start = end - timedelta(days=2)
             timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
 
-   request = StockBarsRequest(
-    symbol_or_symbols=symbol,
-    timeframe=timeframe,
-    start=start,
-    end=end,
-    limit=limit,
-    adjustment=Adjustment.ALL,
-    feed='iex'   # Force IEX data for free tier
-)
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                limit=limit,
+                adjustment=Adjustment.ALL,
+                feed='iex'   # Required for free tier
+            )
             bars = self.data_client.get_stock_bars(request)
 
             if symbol in bars.data and bars.data[symbol]:
@@ -234,7 +246,6 @@ class AlpacaHybridBot:
         logger.info(f"   Buy > {self.buy_threshold} | Sell < {self.sell_threshold}")
         logger.info("="*60)
 
-        # Show account info
         try:
             acc = self.trading_client.get_account()
             logger.info(f"✅ Account ID: {acc.id}")
