@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# HMM REGIME DETECTOR
+# HMM REGIME DETECTOR (Fixed rolling method)
 # ============================================================================
 class HMMRegimeDetector:
     """
@@ -59,16 +59,16 @@ class HMMRegimeDetector:
         self.regime_labels = {0: "BEAR", 1: "SIDEWAYS", 2: "BULL"}
 
     def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-    """Compute period-to-period return and rolling volatility."""
-    if len(df) < 20:
-        return np.array([])
-    # Use pandas Series for rolling
-    close_series = df['close']
-    returns = close_series.pct_change().fillna(0)
-    # 20-period rolling standard deviation of returns
-    volatility = returns.rolling(20).std().fillna(0)
-    X = np.column_stack([returns.values, volatility.values])
-    return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        """Compute period-to-period return and rolling volatility."""
+        if len(df) < 20:
+            return np.array([])
+        # Use pandas Series for rolling
+        close_series = df['close']
+        returns = close_series.pct_change().fillna(0)
+        # 20-period rolling standard deviation of returns
+        volatility = returns.rolling(20).std().fillna(0)
+        X = np.column_stack([returns.values, volatility.values])
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     def fit(self, df: pd.DataFrame):
         """Train the HMM on a large DataFrame."""
@@ -230,7 +230,6 @@ class AlpacaHybridBot:
 
         # HMM Regime Detector
         self.regime_detector = HMMRegimeDetector()
-        # Store current regime per symbol? Regime is market-wide, so one global regime.
         self.current_regime = 1   # default SIDEWAYS
 
         self.load_state()
@@ -272,7 +271,7 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
-    # ---------- Data fetching (same as before) ----------
+    # ---------- Data fetching with date shifting ----------
     async def fetch_many_bars(self, symbol: str, target_bars: int) -> pd.DataFrame:
         all_bars = []
         max_per_request = 10000
@@ -320,7 +319,7 @@ class AlpacaHybridBot:
         logger.info(f"Fetched {len(df)} bars for {symbol}")
         return df
 
-    # ---------- Backtesting (unchanged) ----------
+    # ---------- Backtesting for optimization ----------
     def backtest_strategy(self, df: pd.DataFrame, buy_thr: float, sell_thr: float, order_size_usd: float) -> float:
         if df is None or len(df) < 50:
             return -np.inf
@@ -362,11 +361,10 @@ class AlpacaHybridBot:
             return 0.0
         return daily_returns.mean() / daily_returns.std() * np.sqrt(252)
 
-    # ---------- Optimization (adds HMM retraining) ----------
+    # ---------- Weekly optimization (including HMM retraining) ----------
     async def run_optimization(self):
         logger.info("=== Starting weekly optimization ===")
         new_thresholds = {}
-        # We'll also collect data for HMM retraining (use one symbol's data, e.g., BTC/USD)
         combined_df = None
 
         for symbol in self.symbols:
@@ -377,11 +375,9 @@ class AlpacaHybridBot:
                 new_thresholds[symbol] = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
                 continue
 
-            # Use first symbol for HMM training
             if combined_df is None:
                 combined_df = df
 
-            # Grid search
             best_sharpe = -np.inf
             best_buy, best_sell = self.default_buy, self.default_sell
             buy_grid = np.arange(0.50, 0.76, 0.05)
@@ -401,7 +397,7 @@ class AlpacaHybridBot:
         self.last_optimization = datetime.now()
         self.save_state()
 
-        # Retrain HMM on the combined (or first symbol) dataset
+        # Retrain HMM on the combined (first symbol) dataset
         if combined_df is not None and len(combined_df) >= self.regime_detector.hmm_observation_window:
             logger.info("Retraining HMM regime detector...")
             self.regime_detector.fit(combined_df)
@@ -500,7 +496,7 @@ class AlpacaHybridBot:
         # Start weekly optimizer
         asyncio.create_task(self.weekly_optimizer())
 
-        # Initial HMM training using recent data (fetch 500 bars quickly)
+        # Initial HMM training
         try:
             init_df = await self.fetch_many_bars(self.symbols[0], 600)
             if init_df is not None and len(init_df) >= 500:
@@ -513,8 +509,7 @@ class AlpacaHybridBot:
             cycle_start = datetime.now()
             logger.info(f"--- Cycle {cycle_start} ---")
 
-            # --- Predict market regime before processing symbols ---
-            # Use the most recent data from the first symbol for regime detection
+            # Predict market regime
             df_regime = self.get_historical_bars(self.symbols[0], limit=100)
             if df_regime is not None and len(df_regime) >= 20:
                 regime_id = self.regime_detector.predict_current_regime(df_regime)
@@ -525,7 +520,7 @@ class AlpacaHybridBot:
                 regime_name = "SIDEWAYS (default)"
                 self.current_regime = 1
 
-            # Determine regime multiplier
+            # Regime multipliers
             if self.current_regime == 2:   # BULL
                 buy_mult = 0.9
                 sell_mult = 0.9
@@ -546,12 +541,9 @@ class AlpacaHybridBot:
                     current_price = df['close'].iloc[-1]
                     score = self.ml.predict(df)
 
-                    # Get base thresholds for this symbol
                     base_buy, base_sell = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
-                    # Apply regime multiplier
                     buy_thr = base_buy * buy_mult
                     sell_thr = base_sell * sell_mult
-                    # Clamp to reasonable range
                     buy_thr = max(0.50, min(0.80, buy_thr))
                     sell_thr = max(0.20, min(0.60, sell_thr))
 
