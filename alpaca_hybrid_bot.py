@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Hybrid Alpaca Trading Bot - Mean Reversion + Trend Filter
@@ -28,7 +27,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.enums import Adjustment, Feed   # <-- Fixed import
+from alpaca.data.enums import Adjustment, DataFeed  # ✅ Fixed import
 from alpaca.data.timeframe import TimeFrame
 
 # Setup logging
@@ -149,13 +148,12 @@ class AlpacaHybridBot:
         self.trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper_mode)
         self.data_client = StockHistoricalDataClient(self.api_key, self.secret_key)
 
-        # Symbols: parse comma-separated, strip spaces, ignore any extra text (like comments)
+        # Symbols: parse comma-separated, strip spaces, ignore extra text
         symbols_raw = os.getenv("SYMBOLS", "SPY,QQQ,IWM")
-        # Split by comma, take the first part before any space or comment
         self.symbols = []
         for s in symbols_raw.split(','):
             s = s.strip().split()[0]  # e.g., "IWM (or add" becomes "IWM"
-            if s and s.isalpha():     # only letters, no parentheses
+            if s and s.isalpha():
                 self.symbols.append(s)
         if not self.symbols:
             self.symbols = ['SPY', 'QQQ', 'IWM']
@@ -195,14 +193,14 @@ class AlpacaHybridBot:
             timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
 
             request = StockBarsRequest(
-    symbol_or_symbols=symbol,
-    timeframe=timeframe,
-    start=start,
-    end=end,
-    limit=limit,
-    adjustment=Adjustment.ALL,
-    feed=DataFeed.IEX   # Set to IEX for free tier access
-)
+                symbol_or_symbols=symbol,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                limit=limit,
+                adjustment=Adjustment.ALL,
+                feed=DataFeed.IEX   # ✅ Free tier IEX data
+            )
             bars = self.data_client.get_stock_bars(request)
 
             if symbol in bars.data and bars.data[symbol]:
