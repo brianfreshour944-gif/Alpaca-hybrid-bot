@@ -1,19 +1,20 @@
 
 #!/usr/bin/env python3
 """
-Hybrid Alpaca Trading Bot - Crypto Version
-Mean Reversion + RSI + Trend Filter
-Backtest Win Rate: 74.6% | Return: 7.19%
+Hybrid Alpaca Trading Bot - Crypto Version with Weekly Self‑Tuning
+Phase 1: Weekly backtest on 10k-15k candles + adaptive thresholds.
 
 Environment variables:
 - ALPACA_API_KEY
 - ALPACA_SECRET_KEY
 - PAPER_MODE (default true)
 - INTERVAL_MINUTES (default 5)
-- BUY_THRESHOLD (default 0.62)
-- SELL_THRESHOLD (default 0.38)
-- SYMBOLS (comma-separated crypto pairs, default "BTC/USD,ETH/USD,SOL/USD")
-- ORDER_SIZE_USD (default 10) - dollar amount per trade
+- INIT_BUY_THRESHOLD (default 0.62)
+- INIT_SELL_THRESHOLD (default 0.38)
+- SYMBOLS (comma-separated, default "BTC/USD,ETH/USD,SOL/USD")
+- ORDER_SIZE_USD (default 10)
+- OPTIMIZATION_INTERVAL_DAYS (default 7)
+- BACKTEST_BARS (default 10000)
 """
 
 import asyncio
@@ -23,7 +24,7 @@ import os
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
@@ -71,7 +72,6 @@ class HybridPredictor:
         vol_surge = volume[-1] / vol_avg if vol_avg > 0 else 1
 
         score = 0.5
-        # Z-score contribution
         if z_score < -1.2:
             score += 0.35
         elif z_score < -0.8:
@@ -85,7 +85,6 @@ class HybridPredictor:
         elif z_score > 0.4:
             score -= 0.15
 
-        # RSI contribution
         if rsi < 35:
             score += 0.10
         elif rsi < 45:
@@ -95,13 +94,11 @@ class HybridPredictor:
         elif rsi > 55:
             score -= 0.05
 
-        # Trend filter
         if is_uptrend and score > 0.5:
             score += 0.08
         elif is_downtrend and score < 0.5:
             score -= 0.08
 
-        # Volume confirmation
         if vol_surge > 1.3:
             score += 0.05 if score > 0.5 else -0.05
 
@@ -136,33 +133,34 @@ class AlpacaHybridBot:
         self.paper_mode = os.getenv("PAPER_MODE", "true").lower() == "true"
         self.interval_minutes = int(os.getenv("INTERVAL_MINUTES", "5"))
 
-        # Strategy thresholds
-        self.buy_threshold = float(os.getenv("BUY_THRESHOLD", "0.62"))
-        self.sell_threshold = float(os.getenv("SELL_THRESHOLD", "0.38"))
+        # Initial thresholds (can be overridden by state)
+        self.default_buy = float(os.getenv("INIT_BUY_THRESHOLD", "0.62"))
+        self.default_sell = float(os.getenv("INIT_SELL_THRESHOLD", "0.38"))
 
-        # Order size in USD (crypto fractional trading)
         self.order_size_usd = float(os.getenv("ORDER_SIZE_USD", "10"))
 
-        # API keys from environment
+        # Optimization settings
+        self.optimization_interval_days = int(os.getenv("OPTIMIZATION_INTERVAL_DAYS", "7"))
+        self.backtest_bars = int(os.getenv("BACKTEST_BARS", "10000"))
+
+        # API keys
         self.api_key = os.getenv("ALPACA_API_KEY")
         self.secret_key = os.getenv("ALPACA_SECRET_KEY")
         if not self.api_key or not self.secret_key:
             raise ValueError("Missing ALPACA_API_KEY or ALPACA_SECRET_KEY")
 
-        # Trading client (same for crypto)
         self.trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper_mode)
-
-        # Crypto data client (free tier works!)
         self.data_client = CryptoHistoricalDataClient(self.api_key, self.secret_key)
 
-        # Crypto symbols (default: BTC/USD, ETH/USD, SOL/USD)
         symbols_raw = os.getenv("SYMBOLS", "BTC/USD,ETH/USD,SOL/USD")
         self.symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
 
         self.ml = HybridPredictor()
         self.positions: Dict[str, Dict] = {}
         self.trades: List[Dict] = []
+        self.symbol_thresholds: Dict[str, Tuple[float, float]] = {}  # (buy, sell)
         self.running = True
+        self.last_optimization: Optional[datetime] = None
 
         self.load_state()
 
@@ -173,27 +171,214 @@ class AlpacaHybridBot:
                     data = json.load(f)
                     self.positions = data.get("positions", {})
                     self.trades = data.get("trades", [])
+                    # Load per‑symbol thresholds if present
+                    saved_thresholds = data.get("symbol_thresholds", {})
+                    for sym in self.symbols:
+                        if sym in saved_thresholds:
+                            self.symbol_thresholds[sym] = tuple(saved_thresholds[sym])
+                        else:
+                            self.symbol_thresholds[sym] = (self.default_buy, self.default_sell)
+                    # Load last optimization timestamp
+                    last_opt_str = data.get("last_optimization")
+                    if last_opt_str:
+                        self.last_optimization = datetime.fromisoformat(last_opt_str)
                 logger.info(f"Loaded state: {len(self.positions)} positions, {len(self.trades)} trades")
             except Exception as e:
                 logger.error(f"Error loading state: {e}")
+        else:
+            # No state file, set default thresholds
+            for sym in self.symbols:
+                self.symbol_thresholds[sym] = (self.default_buy, self.default_sell)
 
     def save_state(self):
         try:
+            # Convert tuple thresholds to list for JSON
+            thresholds_serializable = {k: list(v) for k, v in self.symbol_thresholds.items()}
+            state = {
+                "positions": self.positions,
+                "trades": self.trades[-100:],
+                "symbol_thresholds": thresholds_serializable,
+                "last_optimization": self.last_optimization.isoformat() if self.last_optimization else None
+            }
             with open("state.json", "w") as f:
-                json.dump({
-                    "positions": self.positions,
-                    "trades": self.trades[-100:]
-                }, f, indent=2)
+                json.dump(state, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
+    # ---------- Data fetching with pagination ----------
+    async def fetch_many_bars(self, symbol: str, target_bars: int) -> pd.DataFrame:
+        """Fetch up to target_bars 5‑minute bars for a symbol (paginated)."""
+        all_bars = []
+        page_token = None
+        end = datetime.now()
+        # We'll go back up to 90 days to get enough bars
+        start = end - timedelta(days=90)
+        timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
+
+        while len(all_bars) < target_bars:
+            try:
+                request = CryptoBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=timeframe,
+                    start=start,
+                    end=end,
+                    limit=min(10000, target_bars),
+                    page_token=page_token
+                )
+                bars = self.data_client.get_crypto_bars(request)
+                if symbol in bars.data and bars.data[symbol]:
+                    batch = bars.data[symbol]
+                    all_bars.extend(batch)
+                    if bars.next_page_token:
+                        page_token = bars.next_page_token
+                        # Avoid rate limits
+                        await asyncio.sleep(0.5)
+                    else:
+                        break
+                else:
+                    break
+            except Exception as e:
+                logger.error(f"Error fetching bars for {symbol}: {e}")
+                break
+
+        if not all_bars:
+            return pd.DataFrame()
+
+        # Convert to DataFrame
+        df = pd.DataFrame([{
+            'open': bar.open,
+            'high': bar.high,
+            'low': bar.low,
+            'close': bar.close,
+            'volume': bar.volume,
+            'timestamp': bar.timestamp
+        } for bar in all_bars])
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        return df
+
+    # ---------- Backtesting for optimization ----------
+    def backtest_strategy(self, df: pd.DataFrame, buy_thr: float, sell_thr: float, order_size_usd: float) -> float:
+        """
+        Simulate trades on a single symbol's DataFrame.
+        Returns Sharpe ratio (annualized) of the equity curve.
+        """
+        if df is None or len(df) < 50:
+            return -np.inf
+
+        predictor = HybridPredictor()  # fresh instance
+        scores = []
+        for i in range(len(df)):
+            sub_df = df.iloc[:i+1]
+            score = predictor.predict(sub_df)
+            scores.append(score)
+        scores = np.array(scores)
+
+        # Simulate trading
+        cash = 10000.0  # starting capital
+        holdings = 0.0  # units of crypto
+        equity = []
+        in_position = False
+        entry_price = 0.0
+
+        for i, (idx, row) in enumerate(df.iterrows()):
+            price = row['close']
+            score = scores[i]
+
+            if not in_position and score > buy_thr:
+                # Buy
+                qty = order_size_usd / price
+                cash -= order_size_usd
+                holdings = qty
+                entry_price = price
+                in_position = True
+            elif in_position and score < sell_thr:
+                # Sell
+                proceeds = holdings * price
+                cash += proceeds
+                holdings = 0.0
+                in_position = False
+
+            # Current equity
+            current_equity = cash + holdings * price
+            equity.append(current_equity)
+
+        if len(equity) < 2:
+            return -np.inf
+
+        equity_series = pd.Series(equity)
+        # Daily returns (resample to daily for Sharpe)
+        df_back = df.copy()
+        df_back['equity'] = equity_series
+        df_back.set_index('timestamp', inplace=True)
+        daily_equity = df_back['equity'].resample('D').last().dropna()
+        daily_returns = daily_equity.pct_change().dropna()
+        if daily_returns.std() == 0:
+            return 0.0
+        sharpe = daily_returns.mean() / daily_returns.std() * np.sqrt(252)
+        return sharpe
+
+    async def run_optimization(self):
+        """Fetch large historical data, find best thresholds per symbol, update bot."""
+        logger.info("=== Starting weekly optimization ===")
+        new_thresholds = {}
+
+        for symbol in self.symbols:
+            logger.info(f"Fetching {self.backtest_bars} bars for {symbol}...")
+            df = await self.fetch_many_bars(symbol, self.backtest_bars)
+            if df.empty or len(df) < 500:
+                logger.warning(f"Not enough data for {symbol}, keeping current thresholds")
+                new_thresholds[symbol] = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
+                continue
+
+            # Grid search
+            best_sharpe = -np.inf
+            best_buy = self.default_buy
+            best_sell = self.default_sell
+
+            # Coarse grid first, then refine later if desired
+            buy_grid = np.arange(0.50, 0.76, 0.05)   # 0.50, 0.55, 0.60, 0.65, 0.70, 0.75
+            sell_grid = np.arange(0.25, 0.51, 0.05)  # 0.25, 0.30, 0.35, 0.40, 0.45, 0.50
+
+            for buy_thr in buy_grid:
+                for sell_thr in sell_grid:
+                    if buy_thr <= sell_thr:
+                        continue
+                    sharpe = self.backtest_strategy(df, buy_thr, sell_thr, self.order_size_usd)
+                    if sharpe > best_sharpe:
+                        best_sharpe = sharpe
+                        best_buy = buy_thr
+                        best_sell = sell_thr
+
+            logger.info(f"Optimized {symbol}: buy={best_buy:.2f}, sell={best_sell:.2f}, Sharpe={best_sharpe:.3f}")
+            new_thresholds[symbol] = (best_buy, best_sell)
+
+        # Update bot's thresholds
+        self.symbol_thresholds = new_thresholds
+        self.last_optimization = datetime.now()
+        self.save_state()
+        logger.info(f"Optimization complete. New thresholds: {self.symbol_thresholds}")
+
+    async def weekly_optimizer(self):
+        """Background task that runs optimization every N days."""
+        while self.running:
+            # Check if it's time to run
+            now = datetime.now()
+            if self.last_optimization is None:
+                # Run on first start
+                await self.run_optimization()
+            else:
+                days_since = (now - self.last_optimization).days
+                if days_since >= self.optimization_interval_days:
+                    await self.run_optimization()
+            # Sleep for 6 hours then check again
+            await asyncio.sleep(6 * 3600)
+
+    # ---------- Existing methods (unchanged except for threshold usage) ----------
     def get_historical_bars(self, symbol: str, limit: int = 100) -> Optional[pd.DataFrame]:
-        """Fetch crypto bars – free tier, no restrictions."""
         try:
             end = datetime.now()
             start = end - timedelta(days=2)
             timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
-
             request = CryptoBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=timeframe,
@@ -202,7 +387,6 @@ class AlpacaHybridBot:
                 limit=limit
             )
             bars = self.data_client.get_crypto_bars(request)
-
             if symbol in bars.data and bars.data[symbol]:
                 df = pd.DataFrame([{
                     'open': bar.open,
@@ -221,28 +405,22 @@ class AlpacaHybridBot:
             return None
 
     def get_current_price(self, symbol: str) -> Optional[float]:
-        """Get latest price from recent bar."""
         df = self.get_historical_bars(symbol, limit=2)
         if df is not None and not df.empty:
             return df['close'].iloc[-1]
         return None
 
     def submit_order(self, symbol: str, side: OrderSide):
-        """Submit a market order for a fixed USD amount (fractional crypto)."""
         try:
-            # Get current price
             price = self.get_current_price(symbol)
             if price is None:
                 logger.error(f"Cannot get price for {symbol}, order aborted.")
                 return None
-
-            # Calculate quantity (fractional) for logging only
             qty = self.order_size_usd / price
             qty = round(qty, 6)
-
             order = MarketOrderRequest(
                 symbol=symbol,
-                notional=self.order_size_usd,  # Use notional for USD amount
+                notional=self.order_size_usd,
                 side=side,
                 time_in_force=TimeInForce.GTC
             )
@@ -255,12 +433,12 @@ class AlpacaHybridBot:
 
     async def run(self):
         logger.info("="*60)
-        logger.info(f"🚀 Alpaca Crypto Hybrid Bot")
+        logger.info(f"🚀 Alpaca Crypto Hybrid Bot with Weekly Self‑Tuning")
         logger.info(f"   Mode: {'PAPER' if self.paper_mode else 'LIVE'}")
         logger.info(f"   Symbols: {', '.join(self.symbols)}")
         logger.info(f"   Interval: {self.interval_minutes} min")
         logger.info(f"   Order size: ${self.order_size_usd}")
-        logger.info(f"   Buy > {self.buy_threshold} | Sell < {self.sell_threshold}")
+        logger.info(f"   Optimization every {self.optimization_interval_days} days")
         logger.info("="*60)
 
         try:
@@ -270,6 +448,9 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.error(f"Account error: {e}")
             return
+
+        # Start background optimizer
+        asyncio.create_task(self.weekly_optimizer())
 
         while self.running:
             cycle_start = datetime.now()
@@ -284,20 +465,22 @@ class AlpacaHybridBot:
 
                     current_price = df['close'].iloc[-1]
                     score = self.ml.predict(df)
-                    logger.info(f"{symbol} ${current_price:.2f} | Score: {score:.3f}")
+                    # Get current thresholds for this symbol
+                    buy_thr, sell_thr = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
+                    logger.info(f"{symbol} ${current_price:.2f} | Score: {score:.3f} | Thr: buy>{buy_thr} sell<{sell_thr}")
 
-                    if score > self.buy_threshold and symbol not in self.positions:
+                    if score > buy_thr and symbol not in self.positions:
                         logger.info(f"🟢 BUY signal {symbol} @ ${current_price:.2f}")
                         order = self.submit_order(symbol, OrderSide.BUY)
                         if order:
                             self.positions[symbol] = {
                                 'price': current_price,
                                 'entry_time': datetime.now().isoformat(),
-                                'order_id': str(order.id)   # ✅ FIX: convert UUID to string
+                                'order_id': str(order.id)
                             }
                             self.save_state()
 
-                    elif score < self.sell_threshold and symbol in self.positions:
+                    elif score < sell_thr and symbol in self.positions:
                         entry_price = self.positions[symbol]['price']
                         pnl_pct = ((current_price - entry_price) / entry_price) * 100
                         logger.info(f"🔴 SELL signal {symbol} @ ${current_price:.2f} (PnL: {pnl_pct:.2f}%)")
@@ -308,8 +491,7 @@ class AlpacaHybridBot:
                                 'entry_price': entry_price,
                                 'exit_price': current_price,
                                 'pnl_pct': pnl_pct,
-                                'exit_time': datetime.now().isoformat(),
-                                'order_id': str(order.id)   # optional: store as string
+                                'exit_time': datetime.now().isoformat()
                             }
                             self.trades.append(trade_record)
                             del self.positions[symbol]
