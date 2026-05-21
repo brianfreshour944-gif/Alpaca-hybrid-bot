@@ -248,7 +248,7 @@ class AlpacaHybridBot:
                 symbol=symbol,
                 notional=self.order_size_usd,  # Alternative: use 'notional' for USD amount
                 side=side,
-                time_in_force=TimeInForce.DAY
+                time_in_force=TimeInForce.GTC
             )
             resp = self.trading_client.submit_order(order)
             logger.info(f"Order {side} ${self.order_size_usd} of {symbol} (≈{qty} units) | ID: {resp.id}")
