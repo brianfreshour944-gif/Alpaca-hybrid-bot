@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Hybrid Alpaca Trading Bot - Crypto Version with Weekly Self‑Tuning
