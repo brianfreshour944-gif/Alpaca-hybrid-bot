@@ -8,13 +8,13 @@ Environment variables required:
 - ALPACA_SECRET_KEY
 - (Optional) PAPER_MODE = true/false (default true)
 """
-
-import asyncio
+import Adjustment, Feedimport asyncio
 import logging
 import json
 import os
 import numpy as np
 import pandas as pd
+from alpaca.data.enums
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
 
@@ -182,14 +182,15 @@ class AlpacaHybridBot:
             start = end - timedelta(days=2)
             timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
 
-            request = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=timeframe,
-                start=start,
-                end=end,
-                limit=limit,
-                adjustment=Adjustment.ALL
-            )
+   request = StockBarsRequest(
+    symbol_or_symbols=symbol,
+    timeframe=timeframe,
+    start=start,
+    end=end,
+    limit=limit,
+    adjustment=Adjustment.ALL,
+    feed='iex'   # Force IEX data for free tier
+)
             bars = self.data_client.get_stock_bars(request)
 
             if symbol in bars.data and bars.data[symbol]:
