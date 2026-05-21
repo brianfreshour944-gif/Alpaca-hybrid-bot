@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Hybrid Alpaca Trading Bot - Crypto Version with Weekly Self‑Tuning
@@ -205,38 +204,45 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
-    # ---------- Data fetching with pagination ----------
+    # ---------- Data fetching with date shifting (no pagination errors) ----------
     async def fetch_many_bars(self, symbol: str, target_bars: int) -> pd.DataFrame:
-        """Fetch up to target_bars 5‑minute bars for a symbol (paginated)."""
+        """Fetch up to target_bars 5‑minute bars (uses multiple date‑shifted requests)."""
         all_bars = []
-        page_token = None
+        max_per_request = 10000
+        remaining = target_bars
         end = datetime.now()
-        # We'll go back up to 90 days to get enough bars
-        start = end - timedelta(days=90)
-        timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
 
-        while len(all_bars) < target_bars:
+        while remaining > 0:
+            # Estimate how many days back to cover the remaining bars (each day ≈ 288 bars for 5-min)
+            days_back = max(1, (remaining // 200) + 2)
+            start = end - timedelta(days=days_back)
+
             try:
+                timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
                 request = CryptoBarsRequest(
                     symbol_or_symbols=symbol,
                     timeframe=timeframe,
                     start=start,
                     end=end,
-                    limit=min(10000, target_bars),
-                    page_token=page_token
+                    limit=min(max_per_request, remaining)
                 )
                 bars = self.data_client.get_crypto_bars(request)
+
                 if symbol in bars.data and bars.data[symbol]:
                     batch = bars.data[symbol]
                     all_bars.extend(batch)
-                    if bars.next_page_token:
-                        page_token = bars.next_page_token
-                        # Avoid rate limits
-                        await asyncio.sleep(0.5)
-                    else:
+                    remaining -= len(batch)
+
+                    # If we got fewer than requested, we've reached the earliest available data
+                    if len(batch) < min(max_per_request, target_bars):
                         break
+
+                    # Move the end date to the earliest bar's timestamp to avoid overlap
+                    end = batch[0].timestamp - timedelta(minutes=1)
                 else:
                     break
+
+                await asyncio.sleep(0.2)  # be kind to rate limits
             except Exception as e:
                 logger.error(f"Error fetching bars for {symbol}: {e}")
                 break
@@ -244,7 +250,6 @@ class AlpacaHybridBot:
         if not all_bars:
             return pd.DataFrame()
 
-        # Convert to DataFrame
         df = pd.DataFrame([{
             'open': bar.open,
             'high': bar.high,
@@ -254,6 +259,7 @@ class AlpacaHybridBot:
             'timestamp': bar.timestamp
         } for bar in all_bars])
         df = df.sort_values('timestamp').reset_index(drop=True)
+        logger.info(f"Fetched {len(df)} bars for {symbol} (target {target_bars})")
         return df
 
     # ---------- Backtesting for optimization ----------
@@ -275,7 +281,7 @@ class AlpacaHybridBot:
 
         # Simulate trading
         cash = 10000.0  # starting capital
-        holdings = 0.0  # units of crypto
+        holdings = 0.0
         equity = []
         in_position = False
         entry_price = 0.0
@@ -285,20 +291,17 @@ class AlpacaHybridBot:
             score = scores[i]
 
             if not in_position and score > buy_thr:
-                # Buy
                 qty = order_size_usd / price
                 cash -= order_size_usd
                 holdings = qty
                 entry_price = price
                 in_position = True
             elif in_position and score < sell_thr:
-                # Sell
                 proceeds = holdings * price
                 cash += proceeds
                 holdings = 0.0
                 in_position = False
 
-            # Current equity
             current_equity = cash + holdings * price
             equity.append(current_equity)
 
@@ -306,7 +309,6 @@ class AlpacaHybridBot:
             return -np.inf
 
         equity_series = pd.Series(equity)
-        # Daily returns (resample to daily for Sharpe)
         df_back = df.copy()
         df_back['equity'] = equity_series
         df_back.set_index('timestamp', inplace=True)
@@ -335,9 +337,8 @@ class AlpacaHybridBot:
             best_buy = self.default_buy
             best_sell = self.default_sell
 
-            # Coarse grid first, then refine later if desired
-            buy_grid = np.arange(0.50, 0.76, 0.05)   # 0.50, 0.55, 0.60, 0.65, 0.70, 0.75
-            sell_grid = np.arange(0.25, 0.51, 0.05)  # 0.25, 0.30, 0.35, 0.40, 0.45, 0.50
+            buy_grid = np.arange(0.50, 0.76, 0.05)   # 0.50,0.55,0.60,0.65,0.70,0.75
+            sell_grid = np.arange(0.25, 0.51, 0.05)  # 0.25,0.30,0.35,0.40,0.45,0.50
 
             for buy_thr in buy_grid:
                 for sell_thr in sell_grid:
@@ -352,7 +353,6 @@ class AlpacaHybridBot:
             logger.info(f"Optimized {symbol}: buy={best_buy:.2f}, sell={best_sell:.2f}, Sharpe={best_sharpe:.3f}")
             new_thresholds[symbol] = (best_buy, best_sell)
 
-        # Update bot's thresholds
         self.symbol_thresholds = new_thresholds
         self.last_optimization = datetime.now()
         self.save_state()
@@ -361,19 +361,16 @@ class AlpacaHybridBot:
     async def weekly_optimizer(self):
         """Background task that runs optimization every N days."""
         while self.running:
-            # Check if it's time to run
             now = datetime.now()
             if self.last_optimization is None:
-                # Run on first start
                 await self.run_optimization()
             else:
                 days_since = (now - self.last_optimization).days
                 if days_since >= self.optimization_interval_days:
                     await self.run_optimization()
-            # Sleep for 6 hours then check again
-            await asyncio.sleep(6 * 3600)
+            await asyncio.sleep(6 * 3600)  # check every 6 hours
 
-    # ---------- Existing methods (unchanged except for threshold usage) ----------
+    # ---------- Normal trading methods (same as before) ----------
     def get_historical_bars(self, symbol: str, limit: int = 100) -> Optional[pd.DataFrame]:
         try:
             end = datetime.now()
@@ -465,7 +462,6 @@ class AlpacaHybridBot:
 
                     current_price = df['close'].iloc[-1]
                     score = self.ml.predict(df)
-                    # Get current thresholds for this symbol
                     buy_thr, sell_thr = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
                     logger.info(f"{symbol} ${current_price:.2f} | Score: {score:.3f} | Thr: buy>{buy_thr} sell<{sell_thr}")
 
