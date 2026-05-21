@@ -59,15 +59,16 @@ class HMMRegimeDetector:
         self.regime_labels = {0: "BEAR", 1: "SIDEWAYS", 2: "BULL"}
 
     def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        """Compute period-to-period return and rolling volatility."""
-        if len(df) < 20:
-            return np.array([])
-        returns = df['close'].pct_change().fillna(0).values
-        # 20-period volatility
-        volatility = returns.rolling(20).std().fillna(0).values
-        X = np.column_stack([returns, volatility])
-        # Replace inf/nan with 0
-        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    """Compute period-to-period return and rolling volatility."""
+    if len(df) < 20:
+        return np.array([])
+    # Use pandas Series for rolling
+    close_series = df['close']
+    returns = close_series.pct_change().fillna(0)
+    # 20-period rolling standard deviation of returns
+    volatility = returns.rolling(20).std().fillna(0)
+    X = np.column_stack([returns.values, volatility.values])
+    return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     def fit(self, df: pd.DataFrame):
         """Train the HMM on a large DataFrame."""
