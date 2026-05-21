@@ -1,17 +1,15 @@
-
 #!/usr/bin/env python3
 """
-Hybrid Alpaca Trading Bot - Crypto Version with Weekly Self‑Tuning
-Phase 1: Weekly backtest on 10k-15k candles + adaptive thresholds.
+Hybrid Alpaca Trading Bot - Crypto Version
+Phase 2: Weekly self‑tuning + HMM market regime detection.
 
-Environment variables:
-- ALPACA_API_KEY
-- ALPACA_SECRET_KEY
+Environment variables (same as before plus optional):
+- ALPACA_API_KEY, ALPACA_SECRET_KEY
 - PAPER_MODE (default true)
 - INTERVAL_MINUTES (default 5)
 - INIT_BUY_THRESHOLD (default 0.62)
 - INIT_SELL_THRESHOLD (default 0.38)
-- SYMBOLS (comma-separated, default "BTC/USD,ETH/USD,SOL/USD")
+- SYMBOLS (default "BTC/USD,ETH/USD,SOL/USD")
 - ORDER_SIZE_USD (default 10)
 - OPTIMIZATION_INTERVAL_DAYS (default 7)
 - BACKTEST_BARS (default 10000)
@@ -33,6 +31,10 @@ from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+# HMM imports
+from hmmlearn.hmm import GaussianHMM
+from sklearn.preprocessing import StandardScaler
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -41,8 +43,76 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# HMM REGIME DETECTOR
+# ============================================================================
+class HMMRegimeDetector:
+    """
+    Gaussian Hidden Markov Model for 3-state market regime detection.
+    States: 0 = BEAR (high vol, negative returns), 1 = SIDEWAYS, 2 = BULL.
+    """
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.is_fitted = False
+        self.hmm_observation_window = 500   # minimum bars required
+        self.regime_labels = {0: "BEAR", 1: "SIDEWAYS", 2: "BULL"}
+
+    def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
+        """Compute period-to-period return and rolling volatility."""
+        if len(df) < 20:
+            return np.array([])
+        returns = df['close'].pct_change().fillna(0).values
+        # 20-period volatility
+        volatility = returns.rolling(20).std().fillna(0).values
+        X = np.column_stack([returns, volatility])
+        # Replace inf/nan with 0
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def fit(self, df: pd.DataFrame):
+        """Train the HMM on a large DataFrame."""
+        if df is None or len(df) < self.hmm_observation_window:
+            logger.warning("Insufficient data for HMM training.")
+            return
+        X = self._prepare_features(df)
+        if len(X) < self.hmm_observation_window:
+            logger.warning("Not enough feature rows for HMM training.")
+            return
+
+        X_scaled = self.scaler.fit_transform(X)
+        self.model = GaussianHMM(
+            n_components=3,
+            covariance_type="diag",
+            n_iter=1000,
+            random_state=42
+        )
+        try:
+            self.model.fit(X_scaled)
+            self.is_fitted = True
+            logger.info("HMM regime detection model trained successfully.")
+        except Exception as e:
+            logger.error(f"HMM training failed: {e}")
+            self.is_fitted = False
+
+    def predict_current_regime(self, df: pd.DataFrame) -> int:
+        """Predict regime for the most recent bar."""
+        if not self.is_fitted or self.model is None or df is None or len(df) < 20:
+            return 1   # default SIDEWAYS
+        X = self._prepare_features(df)
+        if len(X) == 0:
+            return 1
+        X_recent = X[-1:].reshape(1, -1)
+        X_recent_scaled = self.scaler.transform(X_recent)
+        return self.model.predict(X_recent_scaled)[0]
+
+    def get_regime_name(self, regime_id: int) -> str:
+        return self.regime_labels.get(regime_id, "UNKNOWN")
+
+
+# ============================================================================
+# HYBRID PREDICTOR (unchanged)
+# ============================================================================
 class HybridPredictor:
-    """Your proven hybrid strategy: Mean Reversion + RSI + Trend Filter."""
     def __init__(self):
         self.score_history = []
 
@@ -53,21 +123,17 @@ class HybridPredictor:
         close = df['close'].values
         volume = df['volume'].values
 
-        # Mean reversion (Z-score)
         ma20 = np.mean(close[-20:])
         std20 = np.std(close[-20:])
         z_score = (close[-1] - ma20) / std20 if std20 > 0 else 0
 
-        # RSI
         rsi = self._calculate_rsi(close)
 
-        # Trend (EMA9/EMA21)
         ema9 = self._calculate_ema(close, 9)
         ema21 = self._calculate_ema(close, 21)
         is_uptrend = ema9[-1] > ema21[-1] and close[-1] > ema9[-1]
         is_downtrend = ema9[-1] < ema21[-1] and close[-1] < ema9[-1]
 
-        # Volume surge
         vol_avg = np.mean(volume[-10:])
         vol_surge = volume[-1] / vol_avg if vol_avg > 0 else 1
 
@@ -128,22 +194,21 @@ class HybridPredictor:
         return ema
 
 
+# ============================================================================
+# MAIN BOT WITH HMM REGIME DETECTION
+# ============================================================================
 class AlpacaHybridBot:
     def __init__(self):
         self.paper_mode = os.getenv("PAPER_MODE", "true").lower() == "true"
         self.interval_minutes = int(os.getenv("INTERVAL_MINUTES", "5"))
 
-        # Initial thresholds (can be overridden by state)
         self.default_buy = float(os.getenv("INIT_BUY_THRESHOLD", "0.62"))
         self.default_sell = float(os.getenv("INIT_SELL_THRESHOLD", "0.38"))
 
         self.order_size_usd = float(os.getenv("ORDER_SIZE_USD", "10"))
-
-        # Optimization settings
         self.optimization_interval_days = int(os.getenv("OPTIMIZATION_INTERVAL_DAYS", "7"))
         self.backtest_bars = int(os.getenv("BACKTEST_BARS", "10000"))
 
-        # API keys
         self.api_key = os.getenv("ALPACA_API_KEY")
         self.secret_key = os.getenv("ALPACA_SECRET_KEY")
         if not self.api_key or not self.secret_key:
@@ -158,9 +223,14 @@ class AlpacaHybridBot:
         self.ml = HybridPredictor()
         self.positions: Dict[str, Dict] = {}
         self.trades: List[Dict] = []
-        self.symbol_thresholds: Dict[str, Tuple[float, float]] = {}  # (buy, sell)
+        self.symbol_thresholds: Dict[str, Tuple[float, float]] = {}
         self.running = True
         self.last_optimization: Optional[datetime] = None
+
+        # HMM Regime Detector
+        self.regime_detector = HMMRegimeDetector()
+        # Store current regime per symbol? Regime is market-wide, so one global regime.
+        self.current_regime = 1   # default SIDEWAYS
 
         self.load_state()
 
@@ -171,14 +241,12 @@ class AlpacaHybridBot:
                     data = json.load(f)
                     self.positions = data.get("positions", {})
                     self.trades = data.get("trades", [])
-                    # Load per‑symbol thresholds if present
                     saved_thresholds = data.get("symbol_thresholds", {})
                     for sym in self.symbols:
                         if sym in saved_thresholds:
                             self.symbol_thresholds[sym] = tuple(saved_thresholds[sym])
                         else:
                             self.symbol_thresholds[sym] = (self.default_buy, self.default_sell)
-                    # Load last optimization timestamp
                     last_opt_str = data.get("last_optimization")
                     if last_opt_str:
                         self.last_optimization = datetime.fromisoformat(last_opt_str)
@@ -186,13 +254,11 @@ class AlpacaHybridBot:
             except Exception as e:
                 logger.error(f"Error loading state: {e}")
         else:
-            # No state file, set default thresholds
             for sym in self.symbols:
                 self.symbol_thresholds[sym] = (self.default_buy, self.default_sell)
 
     def save_state(self):
         try:
-            # Convert tuple thresholds to list for JSON
             thresholds_serializable = {k: list(v) for k, v in self.symbol_thresholds.items()}
             state = {
                 "positions": self.positions,
@@ -205,19 +271,16 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
-    # ---------- Data fetching with date shifting (no pagination errors) ----------
+    # ---------- Data fetching (same as before) ----------
     async def fetch_many_bars(self, symbol: str, target_bars: int) -> pd.DataFrame:
-        """Fetch up to target_bars 5‑minute bars (uses multiple date‑shifted requests)."""
         all_bars = []
         max_per_request = 10000
         remaining = target_bars
         end = datetime.now()
 
         while remaining > 0:
-            # Estimate how many days back to cover the remaining bars (each day ≈ 288 bars for 5-min)
             days_back = max(1, (remaining // 200) + 2)
             start = end - timedelta(days=days_back)
-
             try:
                 timeframe = TimeFrame(self.interval_minutes, TimeFrame.Minute)
                 request = CryptoBarsRequest(
@@ -228,29 +291,22 @@ class AlpacaHybridBot:
                     limit=min(max_per_request, remaining)
                 )
                 bars = self.data_client.get_crypto_bars(request)
-
                 if symbol in bars.data and bars.data[symbol]:
                     batch = bars.data[symbol]
                     all_bars.extend(batch)
                     remaining -= len(batch)
-
-                    # If we got fewer than requested, we've reached the earliest available data
                     if len(batch) < min(max_per_request, target_bars):
                         break
-
-                    # Move the end date to the earliest bar's timestamp to avoid overlap
                     end = batch[0].timestamp - timedelta(minutes=1)
                 else:
                     break
-
-                await asyncio.sleep(0.2)  # be kind to rate limits
+                await asyncio.sleep(0.2)
             except Exception as e:
                 logger.error(f"Error fetching bars for {symbol}: {e}")
                 break
 
         if not all_bars:
             return pd.DataFrame()
-
         df = pd.DataFrame([{
             'open': bar.open,
             'high': bar.high,
@@ -260,55 +316,41 @@ class AlpacaHybridBot:
             'timestamp': bar.timestamp
         } for bar in all_bars])
         df = df.sort_values('timestamp').reset_index(drop=True)
-        logger.info(f"Fetched {len(df)} bars for {symbol} (target {target_bars})")
+        logger.info(f"Fetched {len(df)} bars for {symbol}")
         return df
 
-    # ---------- Backtesting for optimization ----------
+    # ---------- Backtesting (unchanged) ----------
     def backtest_strategy(self, df: pd.DataFrame, buy_thr: float, sell_thr: float, order_size_usd: float) -> float:
-        """
-        Simulate trades on a single symbol's DataFrame.
-        Returns Sharpe ratio (annualized) of the equity curve.
-        """
         if df is None or len(df) < 50:
             return -np.inf
-
-        predictor = HybridPredictor()  # fresh instance
+        predictor = HybridPredictor()
         scores = []
         for i in range(len(df)):
             sub_df = df.iloc[:i+1]
-            score = predictor.predict(sub_df)
-            scores.append(score)
+            scores.append(predictor.predict(sub_df))
         scores = np.array(scores)
 
-        # Simulate trading
-        cash = 10000.0  # starting capital
+        cash = 10000.0
         holdings = 0.0
         equity = []
         in_position = False
-        entry_price = 0.0
-
         for i, (idx, row) in enumerate(df.iterrows()):
             price = row['close']
             score = scores[i]
-
             if not in_position and score > buy_thr:
                 qty = order_size_usd / price
                 cash -= order_size_usd
                 holdings = qty
-                entry_price = price
                 in_position = True
             elif in_position and score < sell_thr:
                 proceeds = holdings * price
                 cash += proceeds
                 holdings = 0.0
                 in_position = False
-
-            current_equity = cash + holdings * price
-            equity.append(current_equity)
+            equity.append(cash + holdings * price)
 
         if len(equity) < 2:
             return -np.inf
-
         equity_series = pd.Series(equity)
         df_back = df.copy()
         df_back['equity'] = equity_series
@@ -317,13 +359,14 @@ class AlpacaHybridBot:
         daily_returns = daily_equity.pct_change().dropna()
         if daily_returns.std() == 0:
             return 0.0
-        sharpe = daily_returns.mean() / daily_returns.std() * np.sqrt(252)
-        return sharpe
+        return daily_returns.mean() / daily_returns.std() * np.sqrt(252)
 
+    # ---------- Optimization (adds HMM retraining) ----------
     async def run_optimization(self):
-        """Fetch large historical data, find best thresholds per symbol, update bot."""
         logger.info("=== Starting weekly optimization ===")
         new_thresholds = {}
+        # We'll also collect data for HMM retraining (use one symbol's data, e.g., BTC/USD)
+        combined_df = None
 
         for symbol in self.symbols:
             logger.info(f"Fetching {self.backtest_bars} bars for {symbol}...")
@@ -333,14 +376,15 @@ class AlpacaHybridBot:
                 new_thresholds[symbol] = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
                 continue
 
+            # Use first symbol for HMM training
+            if combined_df is None:
+                combined_df = df
+
             # Grid search
             best_sharpe = -np.inf
-            best_buy = self.default_buy
-            best_sell = self.default_sell
-
-            buy_grid = np.arange(0.50, 0.76, 0.05)   # 0.50,0.55,0.60,0.65,0.70,0.75
-            sell_grid = np.arange(0.25, 0.51, 0.05)  # 0.25,0.30,0.35,0.40,0.45,0.50
-
+            best_buy, best_sell = self.default_buy, self.default_sell
+            buy_grid = np.arange(0.50, 0.76, 0.05)
+            sell_grid = np.arange(0.25, 0.51, 0.05)
             for buy_thr in buy_grid:
                 for sell_thr in sell_grid:
                     if buy_thr <= sell_thr:
@@ -348,19 +392,23 @@ class AlpacaHybridBot:
                     sharpe = self.backtest_strategy(df, buy_thr, sell_thr, self.order_size_usd)
                     if sharpe > best_sharpe:
                         best_sharpe = sharpe
-                        best_buy = buy_thr
-                        best_sell = sell_thr
-
+                        best_buy, best_sell = buy_thr, sell_thr
             logger.info(f"Optimized {symbol}: buy={best_buy:.2f}, sell={best_sell:.2f}, Sharpe={best_sharpe:.3f}")
             new_thresholds[symbol] = (best_buy, best_sell)
 
         self.symbol_thresholds = new_thresholds
         self.last_optimization = datetime.now()
         self.save_state()
-        logger.info(f"Optimization complete. New thresholds: {self.symbol_thresholds}")
+
+        # Retrain HMM on the combined (or first symbol) dataset
+        if combined_df is not None and len(combined_df) >= self.regime_detector.hmm_observation_window:
+            logger.info("Retraining HMM regime detector...")
+            self.regime_detector.fit(combined_df)
+        else:
+            logger.warning("Not enough data to retrain HMM.")
+        logger.info("Optimization complete.")
 
     async def weekly_optimizer(self):
-        """Background task that runs optimization every N days."""
         while self.running:
             now = datetime.now()
             if self.last_optimization is None:
@@ -369,9 +417,9 @@ class AlpacaHybridBot:
                 days_since = (now - self.last_optimization).days
                 if days_since >= self.optimization_interval_days:
                     await self.run_optimization()
-            await asyncio.sleep(6 * 3600)  # check every 6 hours
+            await asyncio.sleep(6 * 3600)
 
-    # ---------- Normal trading methods (same as before) ----------
+    # ---------- Live trading helpers ----------
     def get_historical_bars(self, symbol: str, limit: int = 100) -> Optional[pd.DataFrame]:
         try:
             end = datetime.now()
@@ -429,9 +477,10 @@ class AlpacaHybridBot:
             logger.error(f"Order failed {symbol}: {e}")
             return None
 
+    # ---------- Main loop with regime detection ----------
     async def run(self):
         logger.info("="*60)
-        logger.info(f"🚀 Alpaca Crypto Hybrid Bot with Weekly Self‑Tuning")
+        logger.info(f"🚀 Alpaca Crypto Hybrid Bot with HMM Regime Detection")
         logger.info(f"   Mode: {'PAPER' if self.paper_mode else 'LIVE'}")
         logger.info(f"   Symbols: {', '.join(self.symbols)}")
         logger.info(f"   Interval: {self.interval_minutes} min")
@@ -447,12 +496,44 @@ class AlpacaHybridBot:
             logger.error(f"Account error: {e}")
             return
 
-        # Start background optimizer
+        # Start weekly optimizer
         asyncio.create_task(self.weekly_optimizer())
+
+        # Initial HMM training using recent data (fetch 500 bars quickly)
+        try:
+            init_df = await self.fetch_many_bars(self.symbols[0], 600)
+            if init_df is not None and len(init_df) >= 500:
+                self.regime_detector.fit(init_df)
+                logger.info("Initial HMM training complete.")
+        except Exception as e:
+            logger.warning(f"Initial HMM training failed: {e}")
 
         while self.running:
             cycle_start = datetime.now()
             logger.info(f"--- Cycle {cycle_start} ---")
+
+            # --- Predict market regime before processing symbols ---
+            # Use the most recent data from the first symbol for regime detection
+            df_regime = self.get_historical_bars(self.symbols[0], limit=100)
+            if df_regime is not None and len(df_regime) >= 20:
+                regime_id = self.regime_detector.predict_current_regime(df_regime)
+                self.current_regime = regime_id
+                regime_name = self.regime_detector.get_regime_name(regime_id)
+                logger.info(f"Market regime: {regime_name}")
+            else:
+                regime_name = "SIDEWAYS (default)"
+                self.current_regime = 1
+
+            # Determine regime multiplier
+            if self.current_regime == 2:   # BULL
+                buy_mult = 0.9
+                sell_mult = 0.9
+            elif self.current_regime == 0: # BEAR
+                buy_mult = 1.1
+                sell_mult = 1.1
+            else:                           # SIDEWAYS
+                buy_mult = 1.0
+                sell_mult = 1.0
 
             for symbol in self.symbols:
                 try:
@@ -463,8 +544,17 @@ class AlpacaHybridBot:
 
                     current_price = df['close'].iloc[-1]
                     score = self.ml.predict(df)
-                    buy_thr, sell_thr = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
-                    logger.info(f"{symbol} ${current_price:.2f} | Score: {score:.3f} | Thr: buy>{buy_thr} sell<{sell_thr}")
+
+                    # Get base thresholds for this symbol
+                    base_buy, base_sell = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
+                    # Apply regime multiplier
+                    buy_thr = base_buy * buy_mult
+                    sell_thr = base_sell * sell_mult
+                    # Clamp to reasonable range
+                    buy_thr = max(0.50, min(0.80, buy_thr))
+                    sell_thr = max(0.20, min(0.60, sell_thr))
+
+                    logger.info(f"{symbol} ${current_price:.2f} | Score: {score:.3f} | Base: {base_buy:.2f}/{base_sell:.2f} → Adj: {buy_thr:.2f}/{sell_thr:.2f} [{regime_name}]")
 
                     if score > buy_thr and symbol not in self.positions:
                         logger.info(f"🟢 BUY signal {symbol} @ ${current_price:.2f}")
