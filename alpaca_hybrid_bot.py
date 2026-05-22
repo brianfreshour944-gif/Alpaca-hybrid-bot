@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Hybrid Alpaca Trading Bot - Crypto Version
-Phase 2: Weekly self‑tuning + HMM market regime detection.
+Hybrid Alpaca Trading Bot - Phase 3: Deep Reinforcement Learning
+- PPO agent replaces rule-based score
+- HMM regime detection as state input
+- Weekly training on 15k candles
 
-Environment variables (same as before plus optional):
+Environment variables (same as before):
 - ALPACA_API_KEY, ALPACA_SECRET_KEY
 - PAPER_MODE (default true)
 - INTERVAL_MINUTES (default 5)
-- INIT_BUY_THRESHOLD (default 0.62)
-- INIT_SELL_THRESHOLD (default 0.38)
 - SYMBOLS (default "BTC/USD,ETH/USD,SOL/USD")
 - ORDER_SIZE_USD (default 10)
-- OPTIMIZATION_INTERVAL_DAYS (default 7)
-- BACKTEST_BARS (default 10000)
+- TRAINING_EPISODES (default 5)
+- BACKTEST_BARS (default 15000)
 """
 
 import asyncio
@@ -23,6 +23,8 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
+import warnings
+warnings.filterwarnings("ignore")
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
@@ -30,6 +32,13 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
+
+# RL imports
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
 
 # HMM imports
 from hmmlearn.hmm import GaussianHMM
@@ -44,34 +53,26 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# HMM REGIME DETECTOR (Fixed rolling method)
+# HMM REGIME DETECTOR (unchanged from Phase 2)
 # ============================================================================
 class HMMRegimeDetector:
-    """
-    Gaussian Hidden Markov Model for 3-state market regime detection.
-    States: 0 = BEAR (high vol, negative returns), 1 = SIDEWAYS, 2 = BULL.
-    """
     def __init__(self):
         self.model = None
         self.scaler = StandardScaler()
         self.is_fitted = False
-        self.hmm_observation_window = 500   # minimum bars required
+        self.hmm_observation_window = 500
         self.regime_labels = {0: "BEAR", 1: "SIDEWAYS", 2: "BULL"}
 
     def _prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        """Compute period-to-period return and rolling volatility."""
         if len(df) < 20:
             return np.array([])
-        # Use pandas Series for rolling
         close_series = df['close']
         returns = close_series.pct_change().fillna(0)
-        # 20-period rolling standard deviation of returns
         volatility = returns.rolling(20).std().fillna(0)
         X = np.column_stack([returns.values, volatility.values])
         return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     def fit(self, df: pd.DataFrame):
-        """Train the HMM on a large DataFrame."""
         if df is None or len(df) < self.hmm_observation_window:
             logger.warning("Insufficient data for HMM training.")
             return
@@ -79,14 +80,8 @@ class HMMRegimeDetector:
         if len(X) < self.hmm_observation_window:
             logger.warning("Not enough feature rows for HMM training.")
             return
-
         X_scaled = self.scaler.fit_transform(X)
-        self.model = GaussianHMM(
-            n_components=3,
-            covariance_type="diag",
-            n_iter=1000,
-            random_state=42
-        )
+        self.model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=1000, random_state=42)
         try:
             self.model.fit(X_scaled)
             self.is_fitted = True
@@ -96,9 +91,8 @@ class HMMRegimeDetector:
             self.is_fitted = False
 
     def predict_current_regime(self, df: pd.DataFrame) -> int:
-        """Predict regime for the most recent bar."""
         if not self.is_fitted or self.model is None or df is None or len(df) < 20:
-            return 1   # default SIDEWAYS
+            return 1
         X = self._prepare_features(df)
         if len(X) == 0:
             return 1
@@ -111,104 +105,237 @@ class HMMRegimeDetector:
 
 
 # ============================================================================
-# HYBRID PREDICTOR (unchanged)
+# CUSTOM GYM ENVIRONMENT FOR TRADING
 # ============================================================================
-class HybridPredictor:
-    def __init__(self):
-        self.score_history = []
-
-    def predict(self, df: pd.DataFrame) -> float:
-        if df is None or len(df) < 50:
-            return 0.5
-
-        close = df['close'].values
-        volume = df['volume'].values
-
-        ma20 = np.mean(close[-20:])
-        std20 = np.std(close[-20:])
-        z_score = (close[-1] - ma20) / std20 if std20 > 0 else 0
-
-        rsi = self._calculate_rsi(close)
-
-        ema9 = self._calculate_ema(close, 9)
-        ema21 = self._calculate_ema(close, 21)
-        is_uptrend = ema9[-1] > ema21[-1] and close[-1] > ema9[-1]
-        is_downtrend = ema9[-1] < ema21[-1] and close[-1] < ema9[-1]
-
-        vol_avg = np.mean(volume[-10:])
-        vol_surge = volume[-1] / vol_avg if vol_avg > 0 else 1
-
-        score = 0.5
-        if z_score < -1.2:
-            score += 0.35
-        elif z_score < -0.8:
-            score += 0.25
-        elif z_score < -0.4:
-            score += 0.15
-        elif z_score > 1.2:
-            score -= 0.35
-        elif z_score > 0.8:
-            score -= 0.25
-        elif z_score > 0.4:
-            score -= 0.15
-
-        if rsi < 35:
-            score += 0.10
-        elif rsi < 45:
-            score += 0.05
-        elif rsi > 65:
-            score -= 0.10
-        elif rsi > 55:
-            score -= 0.05
-
-        if is_uptrend and score > 0.5:
-            score += 0.08
-        elif is_downtrend and score < 0.5:
-            score -= 0.08
-
-        if vol_surge > 1.3:
-            score += 0.05 if score > 0.5 else -0.05
-
-        score = max(0.0, min(1.0, score))
-
-        self.score_history.append(score)
-        if len(self.score_history) > 5:
-            self.score_history.pop(0)
-
-        return np.mean(self.score_history) if self.score_history else score
-
+class TradingEnv(gym.Env):
+    """Custom Gym environment for crypto trading with PPO."""
+    
+    def __init__(self, df: pd.DataFrame, order_size_usd: float = 10, initial_balance: float = 10000, window_size: int = 20):
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.order_size_usd = order_size_usd
+        self.initial_balance = initial_balance
+        self.window_size = window_size
+        
+        # Action space: 0 = HOLD, 1 = BUY, 2 = SELL
+        self.action_space = spaces.Discrete(3)
+        
+        # Observation space: [price_returns(window), RSI, volatility, regime, position, balance_ratio]
+        # window_size returns + 5 features = window_size + 5 dimensions
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(window_size + 5,), dtype=np.float32)
+        
+        self.reset()
+    
+    def reset(self, seed=None, options=None):
+        self.current_step = self.window_size
+        self.balance = self.initial_balance
+        self.holdings = 0.0
+        self.in_position = False
+        self.entry_price = 0.0
+        self.trades = []
+        self.done = False
+        
+        return self._get_observation(), {}
+    
+    def _calculate_returns(self, prices: np.ndarray) -> np.ndarray:
+        """Calculate percentage returns."""
+        returns = np.diff(prices) / prices[:-1]
+        returns = np.insert(returns, 0, 0)
+        return np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+    
     def _calculate_rsi(self, prices: np.ndarray, period: int = 14) -> float:
+        """Calculate RSI for the most recent window."""
         if len(prices) < period + 1:
-            return 50
+            return 50.0
         deltas = np.diff(prices[-period-1:])
         gain = np.mean(deltas[deltas > 0]) if any(deltas > 0) else 0.001
         loss = -np.mean(deltas[deltas < 0]) if any(deltas < 0) else 0.001
         rs = gain / loss
-        return 100 - (100 / (1 + rs))
-
-    def _calculate_ema(self, prices: np.ndarray, period: int) -> np.ndarray:
-        alpha = 2 / (period + 1)
-        ema = np.zeros_like(prices)
-        ema[0] = prices[0]
-        for i in range(1, len(prices)):
-            ema[i] = prices[i] * alpha + ema[i-1] * (1 - alpha)
-        return ema
+        rsi = 100 - (100 / (1 + rs))
+        return min(100.0, max(0.0, rsi))
+    
+    def _get_observation(self):
+        """Build observation vector: returns(window) + [RSI, volatility, regime, in_position, balance_ratio]"""
+        start = max(0, self.current_step - self.window_size)
+        end = self.current_step + 1
+        prices = self.df['close'].iloc[start:end].values
+        
+        # Returns window
+        returns = self._calculate_returns(prices)[-self.window_size:]
+        if len(returns) < self.window_size:
+            returns = np.pad(returns, (self.window_size - len(returns), 0), 'constant')
+        
+        # Current features
+        current_price = prices[-1]
+        rsi = self._calculate_rsi(prices)
+        volatility = self.df['close'].pct_change().rolling(20).std().iloc[self.current_step]
+        volatility = 0.0 if pd.isna(volatility) else volatility
+        regime = self.df.get('regime', 1).iloc[self.current_step] if 'regime' in self.df.columns else 1
+        in_position = float(self.in_position)
+        balance_ratio = self.balance / self.initial_balance
+        
+        # Combine
+        features = np.array([rsi, volatility, regime, in_position, balance_ratio], dtype=np.float32)
+        obs = np.concatenate([returns.astype(np.float32), features])
+        return obs
+    
+    def step(self, action):
+        if self.done or self.current_step >= len(self.df) - 1:
+            self.done = True
+            return self._get_observation(), 0.0, True, False, {}
+        
+        current_price = self.df['close'].iloc[self.current_step]
+        
+        # Execute action
+        reward = 0.0
+        
+        if action == 1 and not self.in_position:  # BUY
+            self.holdings = self.order_size_usd / current_price
+            self.balance -= self.order_size_usd
+            self.entry_price = current_price
+            self.in_position = True
+            
+        elif action == 2 and self.in_position:  # SELL
+            proceeds = self.holdings * current_price
+            self.balance += proceeds
+            pnl = (current_price - self.entry_price) / self.entry_price
+            reward = pnl * 100  # reward as percentage return
+            self.trades.append({
+                'entry': self.entry_price,
+                'exit': current_price,
+                'pnl_pct': pnl * 100
+            })
+            self.holdings = 0.0
+            self.in_position = False
+        
+        # Small penalty for holding (to encourage active trading)
+        if self.in_position:
+            reward -= 0.01
+        
+        # Move to next step
+        self.current_step += 1
+        
+        # Check if episode is done
+        if self.current_step >= len(self.df) - 1:
+            self.done = True
+            # Final liquidation
+            if self.in_position:
+                final_price = self.df['close'].iloc[-1]
+                proceeds = self.holdings * final_price
+                self.balance += proceeds
+                pnl = (final_price - self.entry_price) / self.entry_price
+                reward += pnl * 100
+        
+        obs = self._get_observation()
+        return obs, reward, self.done, False, {}
+    
+    def render(self):
+        pass
 
 
 # ============================================================================
-# MAIN BOT WITH HMM REGIME DETECTION
+# PPO TRAINER & CALLBACK
+# ============================================================================
+class SaveModelCallback(BaseCallback):
+    """Save the model periodically during training."""
+    def __init__(self, save_path: str, verbose=0):
+        super().__init__(verbose)
+        self.save_path = save_path
+    
+    def _on_step(self) -> bool:
+        if self.n_calls % 5000 == 0:
+            self.model.save(f"{self.save_path}_step_{self.n_calls}")
+        return True
+
+
+class PPOTrainer:
+    """Handles training of PPO agent on historical data."""
+    
+    def __init__(self, symbol: str, order_size_usd: float = 10, training_episodes: int = 5):
+        self.symbol = symbol
+        self.order_size_usd = order_size_usd
+        self.training_episodes = training_episodes
+        self.model = None
+    
+    def prepare_data_with_regime(self, df: pd.DataFrame, regime_detector: HMMRegimeDetector) -> pd.DataFrame:
+        """Add regime predictions to the dataframe."""
+        df_copy = df.copy()
+        regimes = []
+        for i in range(len(df_copy)):
+            sub_df = df_copy.iloc[:i+1]
+            if len(sub_df) >= 20:
+                regime = regime_detector.predict_current_regime(sub_df)
+            else:
+                regime = 1
+            regimes.append(regime)
+        df_copy['regime'] = regimes
+        return df_copy
+    
+    def train(self, df: pd.DataFrame, regime_detector: HMMRegimeDetector):
+        """Train PPO agent on historical data."""
+        logger.info(f"Training PPO agent for {self.symbol} on {len(df)} bars...")
+        
+        # Add regime to dataframe
+        df_with_regime = self.prepare_data_with_regime(df, regime_detector)
+        
+        # Create environment
+        env = TradingEnv(df_with_regime, order_size_usd=self.order_size_usd)
+        env = DummyVecEnv([lambda: env])
+        
+        # Initialize PPO
+        self.model = PPO(
+            'MlpPolicy',
+            env,
+            verbose=0,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=64,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+            tensorboard_log=None
+        )
+        
+        # Train
+        logger.info("Starting PPO training...")
+        self.model.learn(total_timesteps=self.training_episodes * len(df))
+        logger.info("PPO training complete.")
+        
+        return self.model
+    
+    def save_model(self, path: str):
+        if self.model:
+            self.model.save(path)
+            logger.info(f"Model saved to {path}")
+    
+    def load_model(self, path: str):
+        if os.path.exists(path):
+            self.model = PPO.load(path)
+            logger.info(f"Model loaded from {path}")
+            return True
+        return False
+    
+    def predict(self, observation: np.ndarray) -> Tuple[int, np.ndarray]:
+        """Predict action from observation."""
+        if self.model is None:
+            return 0, np.array([0])  # HOLD if no model
+        action, _ = self.model.predict(observation, deterministic=True)
+        return action, _
+
+
+# ============================================================================
+# MAIN BOT WITH DRL
 # ============================================================================
 class AlpacaHybridBot:
     def __init__(self):
         self.paper_mode = os.getenv("PAPER_MODE", "true").lower() == "true"
         self.interval_minutes = int(os.getenv("INTERVAL_MINUTES", "5"))
-
-        self.default_buy = float(os.getenv("INIT_BUY_THRESHOLD", "0.62"))
-        self.default_sell = float(os.getenv("INIT_SELL_THRESHOLD", "0.38"))
-
         self.order_size_usd = float(os.getenv("ORDER_SIZE_USD", "10"))
+        self.training_episodes = int(os.getenv("TRAINING_EPISODES", "5"))
         self.optimization_interval_days = int(os.getenv("OPTIMIZATION_INTERVAL_DAYS", "7"))
-        self.backtest_bars = int(os.getenv("BACKTEST_BARS", "10000"))
+        self.backtest_bars = int(os.getenv("BACKTEST_BARS", "15000"))
 
         self.api_key = os.getenv("ALPACA_API_KEY")
         self.secret_key = os.getenv("ALPACA_SECRET_KEY")
@@ -221,19 +348,21 @@ class AlpacaHybridBot:
         symbols_raw = os.getenv("SYMBOLS", "BTC/USD,ETH/USD,SOL/USD")
         self.symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
 
-        self.ml = HybridPredictor()
+        # Use first symbol for regime detection (market-wide)
+        self.regime_detector = HMMRegimeDetector()
+        
+        # PPO trainers for each symbol
+        self.trainers: Dict[str, PPOTrainer] = {}
+        self.last_optimization: Optional[datetime] = None
+        self.running = True
+        
+        # State for live trading
+        self.price_history: Dict[str, pd.DataFrame] = {}
         self.positions: Dict[str, Dict] = {}
         self.trades: List[Dict] = []
-        self.symbol_thresholds: Dict[str, Tuple[float, float]] = {}
-        self.running = True
-        self.last_optimization: Optional[datetime] = None
-
-        # HMM Regime Detector
-        self.regime_detector = HMMRegimeDetector()
-        self.current_regime = 1   # default SIDEWAYS
-
+        
         self.load_state()
-
+    
     def load_state(self):
         if os.path.exists("state.json"):
             try:
@@ -241,43 +370,32 @@ class AlpacaHybridBot:
                     data = json.load(f)
                     self.positions = data.get("positions", {})
                     self.trades = data.get("trades", [])
-                    saved_thresholds = data.get("symbol_thresholds", {})
-                    for sym in self.symbols:
-                        if sym in saved_thresholds:
-                            self.symbol_thresholds[sym] = tuple(saved_thresholds[sym])
-                        else:
-                            self.symbol_thresholds[sym] = (self.default_buy, self.default_sell)
                     last_opt_str = data.get("last_optimization")
                     if last_opt_str:
                         self.last_optimization = datetime.fromisoformat(last_opt_str)
                 logger.info(f"Loaded state: {len(self.positions)} positions, {len(self.trades)} trades")
             except Exception as e:
                 logger.error(f"Error loading state: {e}")
-        else:
-            for sym in self.symbols:
-                self.symbol_thresholds[sym] = (self.default_buy, self.default_sell)
-
+    
     def save_state(self):
         try:
-            thresholds_serializable = {k: list(v) for k, v in self.symbol_thresholds.items()}
             state = {
                 "positions": self.positions,
                 "trades": self.trades[-100:],
-                "symbol_thresholds": thresholds_serializable,
                 "last_optimization": self.last_optimization.isoformat() if self.last_optimization else None
             }
             with open("state.json", "w") as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving state: {e}")
-
-    # ---------- Data fetching with date shifting ----------
+    
     async def fetch_many_bars(self, symbol: str, target_bars: int) -> pd.DataFrame:
+        """Fetch up to target_bars 5-minute bars."""
         all_bars = []
         max_per_request = 10000
         remaining = target_bars
         end = datetime.now()
-
+        
         while remaining > 0:
             days_back = max(1, (remaining // 200) + 2)
             start = end - timedelta(days=days_back)
@@ -304,7 +422,7 @@ class AlpacaHybridBot:
             except Exception as e:
                 logger.error(f"Error fetching bars for {symbol}: {e}")
                 break
-
+        
         if not all_bars:
             return pd.DataFrame()
         df = pd.DataFrame([{
@@ -316,108 +434,60 @@ class AlpacaHybridBot:
             'timestamp': bar.timestamp
         } for bar in all_bars])
         df = df.sort_values('timestamp').reset_index(drop=True)
-        logger.info(f"Fetched {len(df)} bars for {symbol}")
         return df
-
-    # ---------- Backtesting for optimization ----------
-    def backtest_strategy(self, df: pd.DataFrame, buy_thr: float, sell_thr: float, order_size_usd: float) -> float:
-        if df is None or len(df) < 50:
-            return -np.inf
-        predictor = HybridPredictor()
-        scores = []
-        for i in range(len(df)):
-            sub_df = df.iloc[:i+1]
-            scores.append(predictor.predict(sub_df))
-        scores = np.array(scores)
-
-        cash = 10000.0
-        holdings = 0.0
-        equity = []
-        in_position = False
-        for i, (idx, row) in enumerate(df.iterrows()):
-            price = row['close']
-            score = scores[i]
-            if not in_position and score > buy_thr:
-                qty = order_size_usd / price
-                cash -= order_size_usd
-                holdings = qty
-                in_position = True
-            elif in_position and score < sell_thr:
-                proceeds = holdings * price
-                cash += proceeds
-                holdings = 0.0
-                in_position = False
-            equity.append(cash + holdings * price)
-
-        if len(equity) < 2:
-            return -np.inf
-        equity_series = pd.Series(equity)
-        df_back = df.copy()
-        df_back['equity'] = equity_series
-        df_back.set_index('timestamp', inplace=True)
-        daily_equity = df_back['equity'].resample('D').last().dropna()
-        daily_returns = daily_equity.pct_change().dropna()
-        if daily_returns.std() == 0:
-            return 0.0
-        return daily_returns.mean() / daily_returns.std() * np.sqrt(252)
-
-    # ---------- Weekly optimization (including HMM retraining) ----------
-    async def run_optimization(self):
-        logger.info("=== Starting weekly optimization ===")
-        new_thresholds = {}
+    
+    async def train_models(self):
+        """Train PPO models for all symbols."""
+        logger.info("=== Starting weekly DRL training ===")
+        
+        # Train HMM first (market-wide)
         combined_df = None
-
+        for symbol in self.symbols:
+            df = await self.fetch_many_bars(symbol, self.backtest_bars)
+            if df.empty or len(df) < 500:
+                logger.warning(f"Insufficient data for {symbol}, skipping HMM training")
+                continue
+            if combined_df is None:
+                combined_df = df
+                break
+        
+        if combined_df is not None and len(combined_df) >= self.regime_detector.hmm_observation_window:
+            logger.info("Training HMM regime detector...")
+            self.regime_detector.fit(combined_df)
+        else:
+            logger.warning("Not enough data for HMM training")
+        
+        # Train PPO for each symbol
         for symbol in self.symbols:
             logger.info(f"Fetching {self.backtest_bars} bars for {symbol}...")
             df = await self.fetch_many_bars(symbol, self.backtest_bars)
             if df.empty or len(df) < 500:
-                logger.warning(f"Not enough data for {symbol}, keeping current thresholds")
-                new_thresholds[symbol] = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
+                logger.warning(f"Not enough data for {symbol}, skipping PPO training")
                 continue
-
-            if combined_df is None:
-                combined_df = df
-
-            best_sharpe = -np.inf
-            best_buy, best_sell = self.default_buy, self.default_sell
-            buy_grid = np.arange(0.50, 0.76, 0.05)
-            sell_grid = np.arange(0.25, 0.51, 0.05)
-            for buy_thr in buy_grid:
-                for sell_thr in sell_grid:
-                    if buy_thr <= sell_thr:
-                        continue
-                    sharpe = self.backtest_strategy(df, buy_thr, sell_thr, self.order_size_usd)
-                    if sharpe > best_sharpe:
-                        best_sharpe = sharpe
-                        best_buy, best_sell = buy_thr, sell_thr
-            logger.info(f"Optimized {symbol}: buy={best_buy:.2f}, sell={best_sell:.2f}, Sharpe={best_sharpe:.3f}")
-            new_thresholds[symbol] = (best_buy, best_sell)
-
-        self.symbol_thresholds = new_thresholds
+            
+            trainer = PPOTrainer(symbol, self.order_size_usd, self.training_episodes)
+            model = trainer.train(df, self.regime_detector)
+            trainer.save_model(f"ppo_model_{symbol.replace('/', '_')}.zip")
+            self.trainers[symbol] = trainer
+        
         self.last_optimization = datetime.now()
         self.save_state()
-
-        # Retrain HMM on the combined (first symbol) dataset
-        if combined_df is not None and len(combined_df) >= self.regime_detector.hmm_observation_window:
-            logger.info("Retraining HMM regime detector...")
-            self.regime_detector.fit(combined_df)
-        else:
-            logger.warning("Not enough data to retrain HMM.")
-        logger.info("Optimization complete.")
-
-    async def weekly_optimizer(self):
+        logger.info("DRL training complete.")
+    
+    async def weekly_trainer(self):
+        """Background task that trains models every N days."""
         while self.running:
             now = datetime.now()
             if self.last_optimization is None:
-                await self.run_optimization()
+                await self.train_models()
             else:
                 days_since = (now - self.last_optimization).days
                 if days_since >= self.optimization_interval_days:
-                    await self.run_optimization()
-            await asyncio.sleep(6 * 3600)
-
-    # ---------- Live trading helpers ----------
+                    await self.train_models()
+            await asyncio.sleep(6 * 3600)  # check every 6 hours
+    
     def get_historical_bars(self, symbol: str, limit: int = 100) -> Optional[pd.DataFrame]:
+        """Fetch recent bars for live trading."""
         try:
             end = datetime.now()
             start = end - timedelta(days=2)
@@ -446,21 +516,58 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.error(f"Error fetching {symbol}: {e}")
             return None
-
-    def get_current_price(self, symbol: str) -> Optional[float]:
-        df = self.get_historical_bars(symbol, limit=2)
-        if df is not None and not df.empty:
-            return df['close'].iloc[-1]
-        return None
-
+    
+    def build_observation(self, symbol: str) -> Optional[np.ndarray]:
+        """Build observation vector for the current state."""
+        df = self.get_historical_bars(symbol, limit=50)
+        if df is None or len(df) < 21:
+            return None
+        
+        # Get returns for last 20 bars
+        closes = df['close'].values
+        returns = np.diff(closes) / closes[:-1]
+        returns = np.insert(returns, 0, 0)
+        returns_window = returns[-20:] if len(returns) >= 20 else np.pad(returns, (20 - len(returns), 0), 'constant')
+        
+        # Get current features
+        current_price = closes[-1]
+        rsi = self._calculate_rsi(closes)
+        volatility = returns.rolling(20).std().iloc[-1] if len(returns) >= 20 else 0
+        volatility = 0.0 if pd.isna(volatility) else volatility
+        
+        # Get regime
+        regime = self.regime_detector.predict_current_regime(df)
+        
+        # Position and balance (simplified for observation)
+        in_position = float(symbol in self.positions)
+        balance_ratio = 1.0  # relative balance (we don't track exact live balance easily)
+        
+        features = np.array([rsi, volatility, float(regime), in_position, balance_ratio], dtype=np.float32)
+        obs = np.concatenate([returns_window.astype(np.float32), features])
+        return obs
+    
+    def _calculate_rsi(self, prices: np.ndarray, period: int = 14) -> float:
+        if len(prices) < period + 1:
+            return 50.0
+        deltas = np.diff(prices[-period-1:])
+        gain = np.mean(deltas[deltas > 0]) if any(deltas > 0) else 0.001
+        loss = -np.mean(deltas[deltas < 0]) if any(deltas < 0) else 0.001
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return min(100.0, max(0.0, rsi))
+    
     def submit_order(self, symbol: str, side: OrderSide):
         try:
-            price = self.get_current_price(symbol)
-            if price is None:
+            # Get current price
+            df = self.get_historical_bars(symbol, limit=2)
+            if df is None or df.empty:
                 logger.error(f"Cannot get price for {symbol}, order aborted.")
                 return None
-            qty = self.order_size_usd / price
+            
+            current_price = df['close'].iloc[-1]
+            qty = self.order_size_usd / current_price
             qty = round(qty, 6)
+            
             order = MarketOrderRequest(
                 symbol=symbol,
                 notional=self.order_size_usd,
@@ -473,18 +580,18 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.error(f"Order failed {symbol}: {e}")
             return None
-
-    # ---------- Main loop with regime detection ----------
+    
     async def run(self):
         logger.info("="*60)
-        logger.info(f"🚀 Alpaca Crypto Hybrid Bot with HMM Regime Detection")
+        logger.info(f"🚀 Alpaca Crypto DRL Bot with HMM + PPO")
         logger.info(f"   Mode: {'PAPER' if self.paper_mode else 'LIVE'}")
         logger.info(f"   Symbols: {', '.join(self.symbols)}")
         logger.info(f"   Interval: {self.interval_minutes} min")
         logger.info(f"   Order size: ${self.order_size_usd}")
-        logger.info(f"   Optimization every {self.optimization_interval_days} days")
+        logger.info(f"   Training episodes: {self.training_episodes}")
+        logger.info(f"   Training every {self.optimization_interval_days} days")
         logger.info("="*60)
-
+        
         try:
             acc = self.trading_client.get_account()
             logger.info(f"✅ Account ID: {acc.id}")
@@ -492,10 +599,20 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.error(f"Account error: {e}")
             return
-
-        # Start weekly optimizer
-        asyncio.create_task(self.weekly_optimizer())
-
+        
+        # Load existing models or train initial ones
+        for symbol in self.symbols:
+            trainer = PPOTrainer(symbol, self.order_size_usd, self.training_episodes)
+            model_path = f"ppo_model_{symbol.replace('/', '_')}.zip"
+            if trainer.load_model(model_path):
+                self.trainers[symbol] = trainer
+                logger.info(f"Loaded existing model for {symbol}")
+            else:
+                logger.info(f"No existing model for {symbol}, will train on first cycle")
+        
+        # Start weekly trainer
+        asyncio.create_task(self.weekly_trainer())
+        
         # Initial HMM training
         try:
             init_df = await self.fetch_many_bars(self.symbols[0], 600)
@@ -504,53 +621,52 @@ class AlpacaHybridBot:
                 logger.info("Initial HMM training complete.")
         except Exception as e:
             logger.warning(f"Initial HMM training failed: {e}")
-
+        
+        # Main trading loop
         while self.running:
             cycle_start = datetime.now()
             logger.info(f"--- Cycle {cycle_start} ---")
-
-            # Predict market regime
+            
+            # Detect market regime
             df_regime = self.get_historical_bars(self.symbols[0], limit=100)
             if df_regime is not None and len(df_regime) >= 20:
                 regime_id = self.regime_detector.predict_current_regime(df_regime)
-                self.current_regime = regime_id
                 regime_name = self.regime_detector.get_regime_name(regime_id)
                 logger.info(f"Market regime: {regime_name}")
             else:
                 regime_name = "SIDEWAYS (default)"
-                self.current_regime = 1
-
-            # Regime multipliers
-            if self.current_regime == 2:   # BULL
-                buy_mult = 0.9
-                sell_mult = 0.9
-            elif self.current_regime == 0: # BEAR
-                buy_mult = 1.1
-                sell_mult = 1.1
-            else:                           # SIDEWAYS
-                buy_mult = 1.0
-                sell_mult = 1.0
-
+                regime_id = 1
+            
             for symbol in self.symbols:
                 try:
-                    df = self.get_historical_bars(symbol, limit=100)
-                    if df is None or len(df) < 50:
-                        logger.warning(f"Insufficient data for {symbol}")
+                    # Get PPO model for this symbol
+                    trainer = self.trainers.get(symbol)
+                    if trainer is None or trainer.model is None:
+                        logger.warning(f"No trained model for {symbol}, skipping")
                         continue
-
+                    
+                    # Build observation
+                    obs = self.build_observation(symbol)
+                    if obs is None:
+                        logger.warning(f"Cannot build observation for {symbol}")
+                        continue
+                    
+                    # Get action from PPO
+                    action, _ = trainer.predict(obs.reshape(1, -1))
+                    
+                    # Get current price for logging
+                    df = self.get_historical_bars(symbol, limit=5)
+                    if df is None or df.empty:
+                        continue
                     current_price = df['close'].iloc[-1]
-                    score = self.ml.predict(df)
-
-                    base_buy, base_sell = self.symbol_thresholds.get(symbol, (self.default_buy, self.default_sell))
-                    buy_thr = base_buy * buy_mult
-                    sell_thr = base_sell * sell_mult
-                    buy_thr = max(0.50, min(0.80, buy_thr))
-                    sell_thr = max(0.20, min(0.60, sell_thr))
-
-                    logger.info(f"{symbol} ${current_price:.2f} | Score: {score:.3f} | Base: {base_buy:.2f}/{base_sell:.2f} → Adj: {buy_thr:.2f}/{sell_thr:.2f} [{regime_name}]")
-
-                    if score > buy_thr and symbol not in self.positions:
-                        logger.info(f"🟢 BUY signal {symbol} @ ${current_price:.2f}")
+                    
+                    # Map action to text
+                    action_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
+                    logger.info(f"{symbol} ${current_price:.2f} | Action: {action_map[action]} | Regime: {regime_name}")
+                    
+                    # Execute action
+                    if action == 1 and symbol not in self.positions:  # BUY
+                        logger.info(f"🟢 RL BUY decision for {symbol} @ ${current_price:.2f}")
                         order = self.submit_order(symbol, OrderSide.BUY)
                         if order:
                             self.positions[symbol] = {
@@ -559,11 +675,11 @@ class AlpacaHybridBot:
                                 'order_id': str(order.id)
                             }
                             self.save_state()
-
-                    elif score < sell_thr and symbol in self.positions:
+                    
+                    elif action == 2 and symbol in self.positions:  # SELL
                         entry_price = self.positions[symbol]['price']
                         pnl_pct = ((current_price - entry_price) / entry_price) * 100
-                        logger.info(f"🔴 SELL signal {symbol} @ ${current_price:.2f} (PnL: {pnl_pct:.2f}%)")
+                        logger.info(f"🔴 RL SELL decision for {symbol} @ ${current_price:.2f} (PnL: {pnl_pct:.2f}%)")
                         order = self.submit_order(symbol, OrderSide.SELL)
                         if order:
                             trade_record = {
@@ -576,17 +692,17 @@ class AlpacaHybridBot:
                             self.trades.append(trade_record)
                             del self.positions[symbol]
                             self.save_state()
-
+                    
                 except Exception as e:
                     logger.error(f"Error on {symbol}: {e}")
-
+            
             elapsed = (datetime.now() - cycle_start).total_seconds()
             wait = max(0, self.interval_minutes * 60 - elapsed)
             logger.info(f"Wait {wait:.0f}s...")
             await asyncio.sleep(wait)
-
+        
         logger.info("Bot stopped.")
-
+    
     def stop(self):
         self.running = False
         self.save_state()
