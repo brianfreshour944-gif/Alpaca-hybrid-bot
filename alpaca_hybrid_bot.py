@@ -159,7 +159,7 @@ class TradingEnv(gym.Env):
         
         rsi = self._calculate_rsi(prices)
         
-        # Calculate volatility safely
+        # FIXED: Use pandas Series for volatility calculation
         close_series = self.df['close']
         returns_series = close_series.pct_change()
         volatility_series = returns_series.rolling(20).std()
@@ -478,7 +478,7 @@ class AlpacaHybridBot:
         
         rsi = self._calculate_rsi(closes)
         
-        # Fix: Use pandas Series for rolling, not numpy array
+        # FIXED: Use pandas Series for rolling, not numpy array
         close_series = df['close']
         returns_series = close_series.pct_change()
         volatility_series = returns_series.rolling(20).std()
