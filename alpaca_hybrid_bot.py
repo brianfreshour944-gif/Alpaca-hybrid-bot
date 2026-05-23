@@ -6,7 +6,7 @@ Hybrid Alpaca Trading Bot - Phase 3: Deep Reinforcement Learning
 - HMM regime detection as state input
 - Weekly training on 15k candles
 
-Environment variables (same as before):
+Environment variables:
 - ALPACA_API_KEY, ALPACA_SECRET_KEY
 - PAPER_MODE (default true)
 - INTERVAL_MINUTES (default 5)
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# HMM REGIME DETECTOR (unchanged from Phase 2)
+# HMM REGIME DETECTOR
 # ============================================================================
 class HMMRegimeDetector:
     def __init__(self):
@@ -118,11 +118,7 @@ class TradingEnv(gym.Env):
         self.initial_balance = initial_balance
         self.window_size = window_size
         
-        # Action space: 0 = HOLD, 1 = BUY, 2 = SELL
         self.action_space = spaces.Discrete(3)
-        
-        # Observation space: [price_returns(window), RSI, volatility, regime, position, balance_ratio]
-        # window_size returns + 5 features = window_size + 5 dimensions
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(window_size + 5,), dtype=np.float32)
         
         self.reset()
@@ -135,17 +131,14 @@ class TradingEnv(gym.Env):
         self.entry_price = 0.0
         self.trades = []
         self.done = False
-        
         return self._get_observation(), {}
     
     def _calculate_returns(self, prices: np.ndarray) -> np.ndarray:
-        """Calculate percentage returns."""
         returns = np.diff(prices) / prices[:-1]
         returns = np.insert(returns, 0, 0)
         return np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
     
     def _calculate_rsi(self, prices: np.ndarray, period: int = 14) -> float:
-        """Calculate RSI for the most recent window."""
         if len(prices) < period + 1:
             return 50.0
         deltas = np.diff(prices[-period-1:])
@@ -156,26 +149,27 @@ class TradingEnv(gym.Env):
         return min(100.0, max(0.0, rsi))
     
     def _get_observation(self):
-        """Build observation vector: returns(window) + [RSI, volatility, regime, in_position, balance_ratio]"""
         start = max(0, self.current_step - self.window_size)
         end = self.current_step + 1
         prices = self.df['close'].iloc[start:end].values
         
-        # Returns window
         returns = self._calculate_returns(prices)[-self.window_size:]
         if len(returns) < self.window_size:
             returns = np.pad(returns, (self.window_size - len(returns), 0), 'constant')
         
-        # Current features
-        current_price = prices[-1]
         rsi = self._calculate_rsi(prices)
-        volatility = self.df['close'].pct_change().rolling(20).std().iloc[self.current_step]
+        
+        # Calculate volatility safely
+        close_series = self.df['close']
+        returns_series = close_series.pct_change()
+        volatility_series = returns_series.rolling(20).std()
+        volatility = volatility_series.iloc[self.current_step] if self.current_step < len(volatility_series) else 0.0
         volatility = 0.0 if pd.isna(volatility) else volatility
+        
         regime = self.df.get('regime', 1).iloc[self.current_step] if 'regime' in self.df.columns else 1
         in_position = float(self.in_position)
         balance_ratio = self.balance / self.initial_balance
         
-        # Combine
         features = np.array([rsi, volatility, regime, in_position, balance_ratio], dtype=np.float32)
         obs = np.concatenate([returns.astype(np.float32), features])
         return obs
@@ -186,40 +180,29 @@ class TradingEnv(gym.Env):
             return self._get_observation(), 0.0, True, False, {}
         
         current_price = self.df['close'].iloc[self.current_step]
-        
-        # Execute action
         reward = 0.0
         
-        if action == 1 and not self.in_position:  # BUY
+        if action == 1 and not self.in_position:
             self.holdings = self.order_size_usd / current_price
             self.balance -= self.order_size_usd
             self.entry_price = current_price
             self.in_position = True
-            
-        elif action == 2 and self.in_position:  # SELL
+        elif action == 2 and self.in_position:
             proceeds = self.holdings * current_price
             self.balance += proceeds
             pnl = (current_price - self.entry_price) / self.entry_price
-            reward = pnl * 100  # reward as percentage return
-            self.trades.append({
-                'entry': self.entry_price,
-                'exit': current_price,
-                'pnl_pct': pnl * 100
-            })
+            reward = pnl * 100
+            self.trades.append({'entry': self.entry_price, 'exit': current_price, 'pnl_pct': pnl * 100})
             self.holdings = 0.0
             self.in_position = False
         
-        # Small penalty for holding (to encourage active trading)
         if self.in_position:
             reward -= 0.01
         
-        # Move to next step
         self.current_step += 1
         
-        # Check if episode is done
         if self.current_step >= len(self.df) - 1:
             self.done = True
-            # Final liquidation
             if self.in_position:
                 final_price = self.df['close'].iloc[-1]
                 proceeds = self.holdings * final_price
@@ -238,7 +221,6 @@ class TradingEnv(gym.Env):
 # PPO TRAINER & CALLBACK
 # ============================================================================
 class SaveModelCallback(BaseCallback):
-    """Save the model periodically during training."""
     def __init__(self, save_path: str, verbose=0):
         super().__init__(verbose)
         self.save_path = save_path
@@ -250,8 +232,6 @@ class SaveModelCallback(BaseCallback):
 
 
 class PPOTrainer:
-    """Handles training of PPO agent on historical data."""
-    
     def __init__(self, symbol: str, order_size_usd: float = 10, training_episodes: int = 5):
         self.symbol = symbol
         self.order_size_usd = order_size_usd
@@ -259,7 +239,6 @@ class PPOTrainer:
         self.model = None
     
     def prepare_data_with_regime(self, df: pd.DataFrame, regime_detector: HMMRegimeDetector) -> pd.DataFrame:
-        """Add regime predictions to the dataframe."""
         df_copy = df.copy()
         regimes = []
         for i in range(len(df_copy)):
@@ -273,37 +252,18 @@ class PPOTrainer:
         return df_copy
     
     def train(self, df: pd.DataFrame, regime_detector: HMMRegimeDetector):
-        """Train PPO agent on historical data."""
         logger.info(f"Training PPO agent for {self.symbol} on {len(df)} bars...")
-        
-        # Add regime to dataframe
         df_with_regime = self.prepare_data_with_regime(df, regime_detector)
-        
-        # Create environment
         env = TradingEnv(df_with_regime, order_size_usd=self.order_size_usd)
         env = DummyVecEnv([lambda: env])
         
-        # Initialize PPO
-        self.model = PPO(
-            'MlpPolicy',
-            env,
-            verbose=0,
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.01,
-            tensorboard_log=None
-        )
+        self.model = PPO('MlpPolicy', env, verbose=0, learning_rate=3e-4, n_steps=2048,
+                         batch_size=64, n_epochs=10, gamma=0.99, gae_lambda=0.95,
+                         clip_range=0.2, ent_coef=0.01, tensorboard_log=None)
         
-        # Train
         logger.info("Starting PPO training...")
         self.model.learn(total_timesteps=self.training_episodes * len(df))
         logger.info("PPO training complete.")
-        
         return self.model
     
     def save_model(self, path: str):
@@ -319,9 +279,8 @@ class PPOTrainer:
         return False
     
     def predict(self, observation: np.ndarray) -> Tuple[int, np.ndarray]:
-        """Predict action from observation."""
         if self.model is None:
-            return 0, np.array([0])  # HOLD if no model
+            return 0, np.array([0])
         action, _ = self.model.predict(observation, deterministic=True)
         return action, _
 
@@ -349,16 +308,10 @@ class AlpacaHybridBot:
         symbols_raw = os.getenv("SYMBOLS", "BTC/USD,ETH/USD,SOL/USD")
         self.symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
 
-        # Use first symbol for regime detection (market-wide)
         self.regime_detector = HMMRegimeDetector()
-        
-        # PPO trainers for each symbol
         self.trainers: Dict[str, PPOTrainer] = {}
         self.last_optimization: Optional[datetime] = None
         self.running = True
-        
-        # State for live trading
-        self.price_history: Dict[str, pd.DataFrame] = {}
         self.positions: Dict[str, Dict] = {}
         self.trades: List[Dict] = []
         
@@ -391,7 +344,6 @@ class AlpacaHybridBot:
             logger.error(f"Error saving state: {e}")
     
     async def fetch_many_bars(self, symbol: str, target_bars: int) -> pd.DataFrame:
-        """Fetch up to target_bars 5-minute bars."""
         all_bars = []
         max_per_request = 10000
         remaining = target_bars
@@ -438,10 +390,8 @@ class AlpacaHybridBot:
         return df
     
     async def train_models(self):
-        """Train PPO models for all symbols."""
         logger.info("=== Starting weekly DRL training ===")
         
-        # Train HMM first (market-wide)
         combined_df = None
         for symbol in self.symbols:
             df = await self.fetch_many_bars(symbol, self.backtest_bars)
@@ -458,7 +408,6 @@ class AlpacaHybridBot:
         else:
             logger.warning("Not enough data for HMM training")
         
-        # Train PPO for each symbol
         for symbol in self.symbols:
             logger.info(f"Fetching {self.backtest_bars} bars for {symbol}...")
             df = await self.fetch_many_bars(symbol, self.backtest_bars)
@@ -467,7 +416,7 @@ class AlpacaHybridBot:
                 continue
             
             trainer = PPOTrainer(symbol, self.order_size_usd, self.training_episodes)
-            model = trainer.train(df, self.regime_detector)
+            trainer.train(df, self.regime_detector)
             trainer.save_model(f"ppo_model_{symbol.replace('/', '_')}.zip")
             self.trainers[symbol] = trainer
         
@@ -476,7 +425,6 @@ class AlpacaHybridBot:
         logger.info("DRL training complete.")
     
     async def weekly_trainer(self):
-        """Background task that trains models every N days."""
         while self.running:
             now = datetime.now()
             if self.last_optimization is None:
@@ -485,10 +433,9 @@ class AlpacaHybridBot:
                 days_since = (now - self.last_optimization).days
                 if days_since >= self.optimization_interval_days:
                     await self.train_models()
-            await asyncio.sleep(6 * 3600)  # check every 6 hours
+            await asyncio.sleep(6 * 3600)
     
     def get_historical_bars(self, symbol: str, limit: int = 100) -> Optional[pd.DataFrame]:
-        """Fetch recent bars for live trading."""
         try:
             end = datetime.now()
             start = end - timedelta(days=2)
@@ -524,24 +471,23 @@ class AlpacaHybridBot:
         if df is None or len(df) < 21:
             return None
         
-        # Get returns for last 20 bars
         closes = df['close'].values
         returns = np.diff(closes) / closes[:-1]
         returns = np.insert(returns, 0, 0)
         returns_window = returns[-20:] if len(returns) >= 20 else np.pad(returns, (20 - len(returns), 0), 'constant')
         
-        # Get current features
-        current_price = closes[-1]
         rsi = self._calculate_rsi(closes)
-        volatility = returns.rolling(20).std().iloc[-1] if len(returns) >= 20 else 0
+        
+        # Fix: Use pandas Series for rolling, not numpy array
+        close_series = df['close']
+        returns_series = close_series.pct_change()
+        volatility_series = returns_series.rolling(20).std()
+        volatility = volatility_series.iloc[-1] if len(volatility_series) > 0 else 0.0
         volatility = 0.0 if pd.isna(volatility) else volatility
         
-        # Get regime
         regime = self.regime_detector.predict_current_regime(df)
-        
-        # Position and balance (simplified for observation)
         in_position = float(symbol in self.positions)
-        balance_ratio = 1.0  # relative balance (we don't track exact live balance easily)
+        balance_ratio = 1.0
         
         features = np.array([rsi, volatility, float(regime), in_position, balance_ratio], dtype=np.float32)
         obs = np.concatenate([returns_window.astype(np.float32), features])
@@ -559,7 +505,6 @@ class AlpacaHybridBot:
     
     def submit_order(self, symbol: str, side: OrderSide):
         try:
-            # Get current price
             df = self.get_historical_bars(symbol, limit=2)
             if df is None or df.empty:
                 logger.error(f"Cannot get price for {symbol}, order aborted.")
@@ -601,7 +546,6 @@ class AlpacaHybridBot:
             logger.error(f"Account error: {e}")
             return
         
-        # Load existing models or train initial ones
         for symbol in self.symbols:
             trainer = PPOTrainer(symbol, self.order_size_usd, self.training_episodes)
             model_path = f"ppo_model_{symbol.replace('/', '_')}.zip"
@@ -611,10 +555,8 @@ class AlpacaHybridBot:
             else:
                 logger.info(f"No existing model for {symbol}, will train on first cycle")
         
-        # Start weekly trainer
         asyncio.create_task(self.weekly_trainer())
         
-        # Initial HMM training
         try:
             init_df = await self.fetch_many_bars(self.symbols[0], 600)
             if init_df is not None and len(init_df) >= 500:
@@ -623,12 +565,10 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.warning(f"Initial HMM training failed: {e}")
         
-        # Main trading loop
         while self.running:
             cycle_start = datetime.now()
             logger.info(f"--- Cycle {cycle_start} ---")
             
-            # Detect market regime
             df_regime = self.get_historical_bars(self.symbols[0], limit=100)
             if df_regime is not None and len(df_regime) >= 20:
                 regime_id = self.regime_detector.predict_current_regime(df_regime)
@@ -636,37 +576,30 @@ class AlpacaHybridBot:
                 logger.info(f"Market regime: {regime_name}")
             else:
                 regime_name = "SIDEWAYS (default)"
-                regime_id = 1
             
             for symbol in self.symbols:
                 try:
-                    # Get PPO model for this symbol
                     trainer = self.trainers.get(symbol)
                     if trainer is None or trainer.model is None:
                         logger.warning(f"No trained model for {symbol}, skipping")
                         continue
                     
-                    # Build observation
                     obs = self.build_observation(symbol)
                     if obs is None:
                         logger.warning(f"Cannot build observation for {symbol}")
                         continue
                     
-                    # Get action from PPO
                     action, _ = trainer.predict(obs.reshape(1, -1))
                     
-                    # Get current price for logging
                     df = self.get_historical_bars(symbol, limit=5)
                     if df is None or df.empty:
                         continue
                     current_price = df['close'].iloc[-1]
                     
-                    # Map action to text
                     action_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
                     logger.info(f"{symbol} ${current_price:.2f} | Action: {action_map[action]} | Regime: {regime_name}")
                     
-                    # Execute action
-                    if action == 1 and symbol not in self.positions:  # BUY
+                    if action == 1 and symbol not in self.positions:
                         logger.info(f"🟢 RL BUY decision for {symbol} @ ${current_price:.2f}")
                         order = self.submit_order(symbol, OrderSide.BUY)
                         if order:
@@ -677,7 +610,7 @@ class AlpacaHybridBot:
                             }
                             self.save_state()
                     
-                    elif action == 2 and symbol in self.positions:  # SELL
+                    elif action == 2 and symbol in self.positions:
                         entry_price = self.positions[symbol]['price']
                         pnl_pct = ((current_price - entry_price) / entry_price) * 100
                         logger.info(f"🔴 RL SELL decision for {symbol} @ ${current_price:.2f} (PnL: {pnl_pct:.2f}%)")
