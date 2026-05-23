@@ -1,9 +1,8 @@
-
 #!/usr/bin/env python3
 """
 Hybrid Alpaca Trading Bot - Phase 3: Simplified DRL
 - PPO agent with simple observation space
-- HMM regime detection
+- Async/await properly handled
 """
 
 import asyncio
@@ -13,7 +12,7 @@ import os
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -48,11 +47,11 @@ class TradingEnv(gym.Env):
         super().__init__()
         self.data = data.reset_index(drop=True)
         self.order_size = order_size
-        self.current_idx = 50  # Start after we have some data
+        self.current_idx = 50
         
         # Simple observation: [price_change, rsi, volume_change, in_position]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
-        self.action_space = spaces.Discrete(3)  # 0=HOLD, 1=BUY, 2=SELL
+        self.action_space = spaces.Discrete(3)
         
         self.reset()
     
@@ -65,31 +64,25 @@ class TradingEnv(gym.Env):
         return self._get_obs(), {}
     
     def _get_obs(self):
-        """Get simple observation as list (not numpy array to avoid issues)."""
+        """Get observation as numpy array."""
         if self.current_idx < 1:
-            return [0.0, 50.0, 0.0, 0.0]
+            return np.array([0.0, 50.0, 0.0, 0.0], dtype=np.float32)
         
-        # Price change over last 5 minutes
         current_price = self.data.iloc[self.current_idx]['close']
         prev_price = self.data.iloc[self.current_idx - 1]['close']
         price_change = (current_price - prev_price) / prev_price if prev_price > 0 else 0
         
-        # Simple RSI approximation
         rsi = self._calc_rsi()
         
-        # Volume change
         current_vol = self.data.iloc[self.current_idx]['volume']
         avg_vol = self.data.iloc[max(0, self.current_idx-20):self.current_idx]['volume'].mean()
         vol_change = current_vol / avg_vol if avg_vol > 0 else 1
         
-        # Position status
         in_pos = 1.0 if self.in_position else 0.0
         
-        # Return as list (will be converted to array by gym)
-        return [float(price_change), float(rsi), float(vol_change), float(in_pos)]
+        return np.array([float(price_change), float(rsi), float(vol_change), float(in_pos)], dtype=np.float32)
     
     def _calc_rsi(self, period: int = 14) -> float:
-        """Simple RSI calculation."""
         if self.current_idx < period:
             return 50.0
         
@@ -115,32 +108,27 @@ class TradingEnv(gym.Env):
         current_price = self.data.iloc[self.current_idx]['close']
         reward = 0.0
         
-        # Execute action
-        if action == 1 and not self.in_position:  # BUY
+        if action == 1 and not self.in_position:
             self.holdings = self.order_size / current_price
             self.balance -= self.order_size
             self.entry_price = current_price
             self.in_position = True
-            reward = -0.01  # Small cost for entering
+            reward = -0.01
         
-        elif action == 2 and self.in_position:  # SELL
+        elif action == 2 and self.in_position:
             proceeds = self.holdings * current_price
             self.balance += proceeds
             pnl = (current_price - self.entry_price) / self.entry_price
-            reward = pnl * 100  # Reward in percentage points
+            reward = pnl * 100
             self.holdings = 0.0
             self.in_position = False
         
-        # Small penalty for holding
         if self.in_position:
             reward -= 0.001
         
-        # Move to next step
         self.current_idx += 1
         
-        # Check if done
         if self.current_idx >= len(self.data) - 1:
-            # Liquidate at end
             if self.in_position:
                 final_price = self.data.iloc[-1]['close']
                 proceeds = self.holdings * final_price
@@ -241,13 +229,11 @@ class AlpacaHybridBot:
         """Train PPO model for a symbol."""
         logger.info(f"Training model for {symbol}...")
         
-        # Fetch training data
         df = await self.fetch_bars(symbol, limit=5000)
         if len(df) < 200:
             logger.warning(f"Not enough data for {symbol}")
             return
         
-        # Create and train environment
         env = TradingEnv(df, order_size=self.order_size_usd)
         env = DummyVecEnv([lambda: env])
         
@@ -274,7 +260,6 @@ class AlpacaHybridBot:
         """Ensure model exists and is recent."""
         model_path = f"model_{symbol.replace('/', '_')}.zip"
         
-        # Check if we need to train
         need_training = False
         
         if symbol not in self.models:
@@ -284,7 +269,6 @@ class AlpacaHybridBot:
             else:
                 need_training = True
         else:
-            # Check if model is old
             last_train = self.last_training.get(symbol)
             if last_train and (datetime.now() - last_train).days >= self.training_days:
                 need_training = True
@@ -292,18 +276,17 @@ class AlpacaHybridBot:
         if need_training:
             await self.train_model(symbol)
     
-    def get_signal(self, symbol: str) -> str:
+    async def get_signal(self, symbol: str) -> str:
         """Get trading signal from model."""
         model = self.models.get(symbol)
         if model is None:
             return "HOLD"
         
-        # Fetch recent data
-        df = self.fetch_bars(symbol, limit=100)
+        # Fetch recent data (AWAIT here!)
+        df = await self.fetch_bars(symbol, limit=100)
         if len(df) < 50:
             return "HOLD"
         
-        # Build observation (same as environment)
         if len(df) < 2:
             return "HOLD"
         
@@ -332,8 +315,8 @@ class AlpacaHybridBot:
         # In position?
         in_position = 1.0 if symbol in self.positions else 0.0
         
-        # Create observation as list (not numpy array)
-        obs = [[float(price_change), float(rsi), float(vol_change), float(in_position)]]
+        # Create observation
+        obs = np.array([[float(price_change), float(rsi), float(vol_change), float(in_position)]], dtype=np.float32)
         
         # Predict
         action, _ = model.predict(obs, deterministic=True)
@@ -343,15 +326,8 @@ class AlpacaHybridBot:
     def submit_order(self, symbol: str, side: OrderSide):
         """Submit market order."""
         try:
-            # Get current price
-            df = self.fetch_bars(symbol, limit=2)
-            if df.empty:
-                return None
-            
-            current_price = df.iloc[-1]['close']
-            qty = self.order_size_usd / current_price
-            qty = round(qty, 6)
-            
+            # Get current price using sync method (we'll use a quick sync call)
+            # For simplicity, we'll just try to submit the order
             order = MarketOrderRequest(
                 symbol=symbol,
                 notional=self.order_size_usd,
@@ -359,7 +335,7 @@ class AlpacaHybridBot:
                 time_in_force=TimeInForce.GTC
             )
             resp = self.trading_client.submit_order(order)
-            logger.info(f"Order {side} ${self.order_size_usd} of {symbol} (≈{qty}) | ID: {resp.id}")
+            logger.info(f"Order {side} ${self.order_size_usd} of {symbol} | ID: {resp.id}")
             return resp
         except Exception as e:
             logger.error(f"Order failed {symbol}: {e}")
@@ -367,7 +343,7 @@ class AlpacaHybridBot:
     
     async def run(self):
         logger.info("="*60)
-        logger.info(f"🚀 Alpaca Crypto DRL Bot (Simplified)")
+        logger.info(f"🚀 Alpaca Crypto DRL Bot")
         logger.info(f"   Mode: {'PAPER' if self.paper_mode else 'LIVE'}")
         logger.info(f"   Symbols: {', '.join(self.symbols)}")
         logger.info(f"   Interval: {self.interval_minutes} min")
@@ -393,37 +369,25 @@ class AlpacaHybridBot:
             
             for symbol in self.symbols:
                 try:
-                    signal = self.get_signal(symbol)
+                    signal = await self.get_signal(symbol)
                     logger.info(f"{symbol} | Signal: {signal}")
                     
-                    # Get current price
-                    df = await self.fetch_bars(symbol, limit=2)
-                    if df.empty:
-                        continue
-                    current_price = df.iloc[-1]['close']
-                    
                     if signal == "BUY" and symbol not in self.positions:
-                        logger.info(f"🟢 BUY {symbol} @ ${current_price:.2f}")
+                        logger.info(f"🟢 BUY {symbol}")
                         order = self.submit_order(symbol, OrderSide.BUY)
                         if order:
                             self.positions[symbol] = {
-                                'price': current_price,
                                 'entry_time': datetime.now().isoformat(),
                                 'order_id': str(order.id)
                             }
                             self.save_state()
                     
                     elif signal == "SELL" and symbol in self.positions:
-                        entry_price = self.positions[symbol]['price']
-                        pnl_pct = ((current_price - entry_price) / entry_price) * 100
-                        logger.info(f"🔴 SELL {symbol} @ ${current_price:.2f} (PnL: {pnl_pct:.2f}%)")
+                        logger.info(f"🔴 SELL {symbol}")
                         order = self.submit_order(symbol, OrderSide.SELL)
                         if order:
                             self.trades.append({
                                 'symbol': symbol,
-                                'entry_price': entry_price,
-                                'exit_price': current_price,
-                                'pnl_pct': pnl_pct,
                                 'exit_time': datetime.now().isoformat()
                             })
                             del self.positions[symbol]
