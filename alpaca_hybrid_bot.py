@@ -159,7 +159,7 @@ class TradingEnv(gym.Env):
         
         rsi = self._calculate_rsi(prices)
         
-        # FIXED: Use pandas Series for volatility calculation
+        # Use pandas Series for volatility calculation
         close_series = self.df['close']
         returns_series = close_series.pct_change()
         volatility_series = returns_series.rolling(20).std()
@@ -278,11 +278,15 @@ class PPOTrainer:
             return True
         return False
     
-    def predict(self, observation: np.ndarray) -> Tuple[int, np.ndarray]:
+    def predict(self, observation: np.ndarray) -> int:
+        """Predict action from observation. Returns action (0, 1, or 2)."""
         if self.model is None:
-            return 0, np.array([0])
+            return 0
+        # Ensure observation is 2D with correct shape
+        if observation.ndim == 1:
+            observation = observation.reshape(1, -1)
         action, _ = self.model.predict(observation, deterministic=True)
-        return action, _
+        return int(action[0])
 
 
 # ============================================================================
@@ -478,7 +482,7 @@ class AlpacaHybridBot:
         
         rsi = self._calculate_rsi(closes)
         
-        # FIXED: Use pandas Series for rolling, not numpy array
+        # Use pandas Series for rolling calculation
         close_series = df['close']
         returns_series = close_series.pct_change()
         volatility_series = returns_series.rolling(20).std()
@@ -555,8 +559,10 @@ class AlpacaHybridBot:
             else:
                 logger.info(f"No existing model for {symbol}, will train on first cycle")
         
+        # Start weekly trainer in background
         asyncio.create_task(self.weekly_trainer())
         
+        # Initial HMM training
         try:
             init_df = await self.fetch_many_bars(self.symbols[0], 600)
             if init_df is not None and len(init_df) >= 500:
@@ -564,6 +570,10 @@ class AlpacaHybridBot:
                 logger.info("Initial HMM training complete.")
         except Exception as e:
             logger.warning(f"Initial HMM training failed: {e}")
+        
+        # Wait for initial training to complete
+        logger.info("Waiting for initial model training...")
+        await asyncio.sleep(10)
         
         while self.running:
             cycle_start = datetime.now()
@@ -589,7 +599,8 @@ class AlpacaHybridBot:
                         logger.warning(f"Cannot build observation for {symbol}")
                         continue
                     
-                    action, _ = trainer.predict(obs.reshape(1, -1))
+                    # Get action from PPO (returns int 0, 1, or 2)
+                    action = trainer.predict(obs)
                     
                     df = self.get_historical_bars(symbol, limit=5)
                     if df is None or df.empty:
