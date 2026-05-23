@@ -1,11 +1,12 @@
+
 #!/usr/bin/env python3
 """
-Hybrid Alpaca Trading Bot - Phase 3: Simplified DRL
+Hybrid Alpaca Trading Bot - Phase 3: Synchronous DRL
 - PPO agent with simple observation space
-- Async/await properly handled
+- Synchronous operations (no async complexity)
 """
 
-import asyncio
+import time
 import logging
 import json
 import os
@@ -49,7 +50,6 @@ class TradingEnv(gym.Env):
         self.order_size = order_size
         self.current_idx = 50
         
-        # Simple observation: [price_change, rsi, volume_change, in_position]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
         self.action_space = spaces.Discrete(3)
         
@@ -64,7 +64,6 @@ class TradingEnv(gym.Env):
         return self._get_obs(), {}
     
     def _get_obs(self):
-        """Get observation as numpy array."""
         if self.current_idx < 1:
             return np.array([0.0, 50.0, 0.0, 0.0], dtype=np.float32)
         
@@ -141,14 +140,13 @@ class TradingEnv(gym.Env):
 
 
 # ============================================================================
-# MAIN BOT
+# MAIN BOT (SYNCHRONOUS)
 # ============================================================================
 class AlpacaHybridBot:
     def __init__(self):
         self.paper_mode = os.getenv("PAPER_MODE", "true").lower() == "true"
         self.interval_minutes = int(os.getenv("INTERVAL_MINUTES", "5"))
         self.order_size_usd = float(os.getenv("ORDER_SIZE_USD", "10"))
-        self.training_days = int(os.getenv("TRAINING_DAYS", "7"))
         
         self.api_key = os.getenv("ALPACA_API_KEY")
         self.secret_key = os.getenv("ALPACA_SECRET_KEY")
@@ -162,8 +160,6 @@ class AlpacaHybridBot:
         self.symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
         
         self.models: Dict[str, PPO] = {}
-        self.last_training: Dict[str, datetime] = {}
-        self.running = True
         self.positions: Dict[str, Dict] = {}
         self.trades: List[Dict] = []
         
@@ -176,11 +172,7 @@ class AlpacaHybridBot:
                     data = json.load(f)
                     self.positions = data.get("positions", {})
                     self.trades = data.get("trades", [])
-                    last_training_str = data.get("last_training", {})
-                    for sym, dt_str in last_training_str.items():
-                        if dt_str:
-                            self.last_training[sym] = datetime.fromisoformat(dt_str)
-                logger.info(f"Loaded state: {len(self.positions)} positions")
+                logger.info(f"Loaded state: {len(self.positions)} positions, {len(self.trades)} trades")
             except Exception as e:
                 logger.error(f"Error loading state: {e}")
     
@@ -188,16 +180,15 @@ class AlpacaHybridBot:
         try:
             state = {
                 "positions": self.positions,
-                "trades": self.trades[-100:],
-                "last_training": {k: v.isoformat() for k, v in self.last_training.items() if v}
+                "trades": self.trades[-100:]
             }
             with open("state.json", "w") as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving state: {e}")
     
-    async def fetch_bars(self, symbol: str, limit: int = 1000) -> pd.DataFrame:
-        """Fetch historical bars."""
+    def fetch_bars(self, symbol: str, limit: int = 1000) -> pd.DataFrame:
+        """Fetch historical bars (synchronous)."""
         try:
             end = datetime.now()
             start = end - timedelta(days=30)
@@ -225,11 +216,11 @@ class AlpacaHybridBot:
             logger.error(f"Error fetching {symbol}: {e}")
             return pd.DataFrame()
     
-    async def train_model(self, symbol: str):
+    def train_model(self, symbol: str):
         """Train PPO model for a symbol."""
         logger.info(f"Training model for {symbol}...")
         
-        df = await self.fetch_bars(symbol, limit=5000)
+        df = self.fetch_bars(symbol, limit=5000)
         if len(df) < 200:
             logger.warning(f"Not enough data for {symbol}")
             return
@@ -252,38 +243,28 @@ class AlpacaHybridBot:
         model.learn(total_timesteps=10000)
         model.save(f"model_{symbol.replace('/', '_')}.zip")
         self.models[symbol] = model
-        self.last_training[symbol] = datetime.now()
-        self.save_state()
         logger.info(f"Training complete for {symbol}")
     
-    async def ensure_model_trained(self, symbol: str):
-        """Ensure model exists and is recent."""
+    def ensure_model(self, symbol: str):
+        """Ensure model exists."""
         model_path = f"model_{symbol.replace('/', '_')}.zip"
-        
-        need_training = False
         
         if symbol not in self.models:
             if os.path.exists(model_path):
                 logger.info(f"Loading existing model for {symbol}")
                 self.models[symbol] = PPO.load(model_path)
             else:
-                need_training = True
-        else:
-            last_train = self.last_training.get(symbol)
-            if last_train and (datetime.now() - last_train).days >= self.training_days:
-                need_training = True
-        
-        if need_training:
-            await self.train_model(symbol)
+                logger.info(f"No model found for {symbol}, training...")
+                self.train_model(symbol)
     
-    async def get_signal(self, symbol: str) -> str:
+    def get_signal(self, symbol: str) -> str:
         """Get trading signal from model."""
         model = self.models.get(symbol)
         if model is None:
             return "HOLD"
         
-        # Fetch recent data (AWAIT here!)
-        df = await self.fetch_bars(symbol, limit=100)
+        # Fetch recent data
+        df = self.fetch_bars(symbol, limit=100)
         if len(df) < 50:
             return "HOLD"
         
@@ -326,8 +307,6 @@ class AlpacaHybridBot:
     def submit_order(self, symbol: str, side: OrderSide):
         """Submit market order."""
         try:
-            # Get current price using sync method (we'll use a quick sync call)
-            # For simplicity, we'll just try to submit the order
             order = MarketOrderRequest(
                 symbol=symbol,
                 notional=self.order_size_usd,
@@ -341,9 +320,10 @@ class AlpacaHybridBot:
             logger.error(f"Order failed {symbol}: {e}")
             return None
     
-    async def run(self):
+    def run(self):
+        """Main trading loop (synchronous)."""
         logger.info("="*60)
-        logger.info(f"🚀 Alpaca Crypto DRL Bot")
+        logger.info(f"🚀 Alpaca Crypto DRL Bot (Synchronous)")
         logger.info(f"   Mode: {'PAPER' if self.paper_mode else 'LIVE'}")
         logger.info(f"   Symbols: {', '.join(self.symbols)}")
         logger.info(f"   Interval: {self.interval_minutes} min")
@@ -358,60 +338,64 @@ class AlpacaHybridBot:
             logger.error(f"Account error: {e}")
             return
         
-        # Load/train models
+        # Ensure models are loaded/trained
         for symbol in self.symbols:
-            await self.ensure_model_trained(symbol)
+            self.ensure_model(symbol)
         
         # Main trading loop
-        while self.running:
-            cycle_start = datetime.now()
-            logger.info(f"--- Cycle {cycle_start} ---")
-            
-            for symbol in self.symbols:
-                try:
-                    signal = await self.get_signal(symbol)
-                    logger.info(f"{symbol} | Signal: {signal}")
-                    
-                    if signal == "BUY" and symbol not in self.positions:
-                        logger.info(f"🟢 BUY {symbol}")
-                        order = self.submit_order(symbol, OrderSide.BUY)
-                        if order:
-                            self.positions[symbol] = {
-                                'entry_time': datetime.now().isoformat(),
-                                'order_id': str(order.id)
-                            }
-                            self.save_state()
-                    
-                    elif signal == "SELL" and symbol in self.positions:
-                        logger.info(f"🔴 SELL {symbol}")
-                        order = self.submit_order(symbol, OrderSide.SELL)
-                        if order:
-                            self.trades.append({
-                                'symbol': symbol,
-                                'exit_time': datetime.now().isoformat()
-                            })
-                            del self.positions[symbol]
-                            self.save_state()
-                    
-                except Exception as e:
-                    logger.error(f"Error on {symbol}: {e}")
-            
-            elapsed = (datetime.now() - cycle_start).total_seconds()
-            wait = max(0, self.interval_minutes * 60 - elapsed)
-            logger.info(f"Wait {wait:.0f}s...")
-            await asyncio.sleep(wait)
+        while True:
+            try:
+                cycle_start = datetime.now()
+                logger.info(f"--- Cycle {cycle_start} ---")
+                
+                for symbol in self.symbols:
+                    try:
+                        signal = self.get_signal(symbol)
+                        logger.info(f"{symbol} | Signal: {signal}")
+                        
+                        if signal == "BUY" and symbol not in self.positions:
+                            logger.info(f"🟢 BUY {symbol}")
+                            order = self.submit_order(symbol, OrderSide.BUY)
+                            if order:
+                                self.positions[symbol] = {
+                                    'entry_time': datetime.now().isoformat(),
+                                    'order_id': str(order.id)
+                                }
+                                self.save_state()
+                        
+                        elif signal == "SELL" and symbol in self.positions:
+                            logger.info(f"🔴 SELL {symbol}")
+                            order = self.submit_order(symbol, OrderSide.SELL)
+                            if order:
+                                self.trades.append({
+                                    'symbol': symbol,
+                                    'exit_time': datetime.now().isoformat()
+                                })
+                                del self.positions[symbol]
+                                self.save_state()
+                        
+                    except Exception as e:
+                        logger.error(f"Error on {symbol}: {e}")
+                
+                # Wait for next interval
+                elapsed = (datetime.now() - cycle_start).total_seconds()
+                wait = max(0, self.interval_minutes * 60 - elapsed)
+                logger.info(f"Wait {wait:.0f}s...")
+                time.sleep(wait)
+                
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                logger.error(f"Loop error: {e}")
+                time.sleep(60)
         
         logger.info("Bot stopped.")
-    
-    def stop(self):
-        self.running = False
         self.save_state()
 
 
 if __name__ == "__main__":
     bot = AlpacaHybridBot()
     try:
-        asyncio.run(bot.run())
+        bot.run()
     except KeyboardInterrupt:
-        bot.stop()
         logger.info("Shutdown complete.")
