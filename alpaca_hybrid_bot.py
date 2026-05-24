@@ -129,8 +129,7 @@ class GrokApexIroncladBot:
         self.paper_mode = paper_mode
         self.interval_minutes = interval_minutes
         
-        # THRESHOLDS - TEMPORARILY LOWERED FOR TESTING
-        # Change back to 0.62/0.38 after verifying metrics work
+        # THRESHOLDS - LOWERED FOR TESTING
         self.buy_threshold = 0.51   # Temporarily lowered from 0.62
         self.sell_threshold = 0.49  # Temporarily raised from 0.38
         self.position_size = 0.01
@@ -150,12 +149,12 @@ class GrokApexIroncladBot:
         self.trades = []
         self.running = True
         
-        # START METRICS ON PORT 3000 (KEEP AS WORKING CONFIGURATION)
+        # START METRICS ON PORT 3001 (CHANGED FROM 3000 TO AVOID CONFLICT)
         logger.info("=" * 60)
-        logger.info("Starting Prometheus metrics server on port 3000...")
-        logger.info("Metrics available at: http://localhost:3000/metrics")
+        logger.info("Starting Prometheus metrics server on port 3001...")
+        logger.info("Metrics available at: http://localhost:3001/metrics")
         logger.info("=" * 60)
-        start_http_server(3000)
+        start_http_server(3001)
         
         self.load_state()
 
@@ -229,7 +228,7 @@ class GrokApexIroncladBot:
             logger.info("🚀 PAPER TRADING MODE - HYBRID STRATEGY")
             logger.info(f"📊 Backtest Results: 74.6% Win Rate | 7.19% Return")
             logger.info(f"🎯 Buy Threshold: {self.buy_threshold} | Sell: {self.sell_threshold}")
-            logger.info(f"📈 Prometheus metrics: http://localhost:3000/metrics")
+            logger.info(f"📈 Prometheus metrics: http://localhost:3001/metrics")
             logger.info("=" * 60)
         
         await exchange.load_markets()
