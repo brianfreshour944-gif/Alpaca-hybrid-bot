@@ -1,6 +1,6 @@
 
 #!/usr/bin/env python3
-# GROK_OKX_APEX_V8 - HYBRID STRATEGY (FULL METRICS VERSION)
+# GROK_OKX_APEX_V8 - HYBRID STRATEGY (WITH POSTGRESQL TRADING DASHBOARD)
 
 import asyncio
 import ccxt.pro as ccxtpro
@@ -11,31 +11,147 @@ import json
 import os
 import time
 from datetime import datetime
-
-# Import Prometheus tools
-from prometheus_client import start_http_server, Gauge, Counter, Histogram
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# PROMETHEUS METRICS - COMPLETE TRADING METRICS
+# POSTGRESQL DATABASE SETUP
 # ==============================================================================
 
-# Existing metrics
+def init_database():
+    """Initialize PostgreSQL database and create trades table"""
+    try:
+        conn = psycopg2.connect(
+            host="postgresql",
+            database="grafana",
+            user="grafana",
+            password="grafana"
+        )
+        cur = conn.cursor()
+        
+        # Create trades table (similar to TradeLab's structure)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                symbol VARCHAR(20),
+                side VARCHAR(10),
+                entry_price DECIMAL(20, 8),
+                exit_price DECIMAL(20, 8),
+                quantity DECIMAL(20, 8),
+                pnl_pct DECIMAL(10, 4),
+                pnl_usdt DECIMAL(20, 4),
+                score DECIMAL(10, 4),
+                status VARCHAR(20) DEFAULT 'OPEN'
+            )
+        """)
+        
+        # Create strategy_scores table for tracking predictions
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_scores (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                symbol VARCHAR(20),
+                score DECIMAL(10, 4),
+                price DECIMAL(20, 8)
+            )
+        """)
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("✅ PostgreSQL database initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        logger.warning("⚠️  Continuing without database - trades will not be saved")
+        return False
+
+def save_trade(symbol, side, price, score, quantity=0.01):
+    """Save a trade to PostgreSQL"""
+    try:
+        conn = psycopg2.connect(
+            host="postgresql",
+            database="grafana",
+            user="grafana",
+            password="grafana"
+        )
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trades (symbol, side, entry_price, score, quantity, status)
+            VALUES (%s, %s, %s, %s, %s, 'OPEN')
+        """, (symbol, side, price, score, quantity))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"💾 Trade saved to database: {side} {symbol} @ ${price:.2f}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save trade: {e}")
+        return False
+
+def update_trade_exit(symbol, exit_price, pnl_pct, pnl_usdt):
+    """Update an open trade with exit information"""
+    try:
+        conn = psycopg2.connect(
+            host="postgresql",
+            database="grafana",
+            user="grafana",
+            password="grafana"
+        )
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE trades 
+            SET exit_price = %s, pnl_pct = %s, pnl_usdt = %s, status = 'CLOSED'
+            WHERE symbol = %s AND side = 'BUY' AND status = 'OPEN'
+            ORDER BY timestamp DESC LIMIT 1
+        """, (exit_price, pnl_pct, pnl_usdt, symbol))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"💾 Trade exit saved: {symbol} PnL: {pnl_pct:.2f}%")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update trade exit: {e}")
+        return False
+
+def save_strategy_score(symbol, score, price):
+    """Save strategy score for historical analysis"""
+    try:
+        conn = psycopg2.connect(
+            host="postgresql",
+            database="grafana",
+            user="grafana",
+            password="grafana"
+        )
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO strategy_scores (symbol, score, price)
+            VALUES (%s, %s, %s)
+        """, (symbol, score, price))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        pass  # Silent fail for scores - not critical
+
+# ==============================================================================
+# PROMETHEUS METRICS (Keep for compatibility)
+# ==============================================================================
+
+from prometheus_client import start_http_server, Gauge, Counter
+
 HYBRID_STRATEGY_SCORE = Gauge('hybrid_strategy_score', 'Latest strategy prediction score', ['symbol'])
 HYBRID_POSITION_STATUS = Gauge('hybrid_position_status', 'Active position status', ['symbol'])
 HYBRID_LAST_PNL_PCT = Gauge('hybrid_last_pnl_pct', 'PnL % of last closed trade', ['symbol'])
-
-# NEW TRADING METRICS FOR BUY/SELL LOGS
 TRADES_TOTAL = Counter('trading_trades_total', 'Total number of trades executed', ['symbol', 'side'])
-TRADING_VOLUME_USDT = Counter('trading_volume_usdt_total', 'Total trading volume in USDT', ['symbol'])
-RUNNING_PNL_USDT = Gauge('trading_running_pnl_usdt', 'Accumulated P&L in USDT', ['symbol'])
-CURRENT_PRICE = Gauge('trading_current_price_usdt', 'Current market price', ['symbol'])
-TOTAL_PNL_USDT = Gauge('trading_total_pnl_usdt', 'Total P&L across all symbols')
-OPEN_POSITIONS_COUNT = Gauge('trading_open_positions_count', 'Number of currently open positions')
-PREDICTIONS_TOTAL = Counter('strategy_predictions_total', 'Total number of strategy predictions', ['symbol'])
 
+# ==============================================================================
+# HYBRID PREDICTOR (Your existing strategy)
+# ==============================================================================
 
 class HybridPredictor:
     def __init__(self):
@@ -123,21 +239,19 @@ class HybridPredictor:
             ema[i] = prices[i] * alpha + ema[i-1] * (1 - alpha)
         return ema
 
+# ==============================================================================
+# MAIN BOT CLASS
+# ==============================================================================
 
 class GrokApexIroncladBot:
     def __init__(self, paper_mode: bool = True, interval_minutes: int = 5):
         self.paper_mode = paper_mode
         self.interval_minutes = interval_minutes
         
-        # THRESHOLDS - LOWERED FOR TESTING
-        self.buy_threshold = 0.51   # Temporarily lowered from 0.62
-        self.sell_threshold = 0.49  # Temporarily raised from 0.38
+        # Lowered thresholds for more trading activity
+        self.buy_threshold = 0.51
+        self.sell_threshold = 0.49
         self.position_size = 0.01
-        
-        # Track P&L per symbol
-        self.symbol_pnl = {symbol: 0.0 for symbol in ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']}
-        self.total_trades_count = 0
-        self.winning_trades_count = 0
         
         self.api_key = os.getenv("OKX_API_KEY", "")
         self.secret = os.getenv("OKX_SECRET_KEY", "")
@@ -148,13 +262,17 @@ class GrokApexIroncladBot:
         self.positions = {}
         self.trades = []
         self.running = True
+        self.total_pnl = 0.0
         
-        # START METRICS ON PORT 3001 (CHANGED FROM 3000 TO AVOID CONFLICT)
-        logger.info("=" * 60)
-        logger.info("Starting Prometheus metrics server on port 3001...")
-        logger.info("Metrics available at: http://localhost:3001/metrics")
-        logger.info("=" * 60)
-        start_http_server(3001)
+        # Initialize database
+        self.db_enabled = init_database()
+        
+        # Start Prometheus metrics (optional, on port 3000)
+        try:
+            start_http_server(3000)
+            logger.info("📊 Prometheus metrics available on port 3000")
+        except Exception as e:
+            logger.warning(f"Could not start Prometheus server: {e}")
         
         self.load_state()
 
@@ -165,35 +283,15 @@ class GrokApexIroncladBot:
                     data = json.load(f)
                     self.positions = data.get("positions", {})
                     self.trades = data.get("trades", [])
-                    self.symbol_pnl = data.get("symbol_pnl", self.symbol_pnl)
-                    self.total_trades_count = data.get("total_trades_count", 0)
-                    self.winning_trades_count = data.get("winning_trades_count", 0)
-                    
-                for symbol in self.symbols:
-                    if symbol in self.positions:
-                        HYBRID_POSITION_STATUS.labels(symbol=symbol).set(1)
-                    else:
-                        HYBRID_POSITION_STATUS.labels(symbol=symbol).set(0)
-                    RUNNING_PNL_USDT.labels(symbol=symbol).set(self.symbol_pnl.get(symbol, 0.0))
-                    
-                TOTAL_PNL_USDT.set(sum(self.symbol_pnl.values()))
-                OPEN_POSITIONS_COUNT.set(len(self.positions))
-                logger.info("✅ State loaded successfully")
-            except Exception as e:
-                logger.error(f"Error loading state: {e}")
+            except:
+                pass
 
     def save_state(self):
         try:
             with open("grok_apex_state.json", "w") as f:
-                json.dump({
-                    "positions": self.positions, 
-                    "trades": self.trades[-100:],
-                    "symbol_pnl": self.symbol_pnl,
-                    "total_trades_count": self.total_trades_count,
-                    "winning_trades_count": self.winning_trades_count
-                }, f)
-        except Exception as e:
-            logger.error(f"Error saving state: {e}")
+                json.dump({"positions": self.positions, "trades": self.trades[-100:]}, f)
+        except:
+            pass
 
     async def fetch_symbol_data(self, exchange, symbol):
         try:
@@ -226,13 +324,12 @@ class GrokApexIroncladBot:
             exchange.set_sandbox_mode(True)
             logger.info("=" * 60)
             logger.info("🚀 PAPER TRADING MODE - HYBRID STRATEGY")
-            logger.info(f"📊 Backtest Results: 74.6% Win Rate | 7.19% Return")
             logger.info(f"🎯 Buy Threshold: {self.buy_threshold} | Sell: {self.sell_threshold}")
-            logger.info(f"📈 Prometheus metrics: http://localhost:3001/metrics")
+            logger.info(f"💾 Database enabled: {self.db_enabled}")
             logger.info("=" * 60)
         
         await exchange.load_markets()
-        logger.info(f"📈 Tracking {len(self.symbols)} symbols: {', '.join(self.symbols)}")
+        logger.info(f"📈 Tracking {len(self.symbols)} symbols")
         
         while self.running:
             await self.wait_for_next_even_interval()
@@ -245,28 +342,27 @@ class GrokApexIroncladBot:
                     continue
                 
                 try:
-                    # Update current price metric
-                    CURRENT_PRICE.labels(symbol=symbol).set(price)
-                    
                     score = self.ml.predict(df)
                     
-                    # Record prediction
-                    PREDICTIONS_TOTAL.labels(symbol=symbol).inc()
+                    logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f}")
                     
-                    logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Thresh: {self.buy_threshold}/{self.sell_threshold}")
+                    # Save score to database
+                    if self.db_enabled:
+                        save_strategy_score(symbol, score, price)
                     
-                    # Send live model scores to Prometheus
+                    # Update Prometheus
                     HYBRID_STRATEGY_SCORE.labels(symbol=symbol).set(score)
                     
                     # ========== BUY SIGNAL ==========
                     if score > self.buy_threshold and symbol not in self.positions:
                         logger.info(f"🟢 BUY: {symbol} @ ${price:.2f} (Score: {score:.3f})")
                         
-                        # Record buy trade metric
-                        TRADES_TOTAL.labels(symbol=symbol, side='buy').inc()
+                        # Save to database
+                        if self.db_enabled:
+                            save_trade(symbol, 'BUY', price, score, self.position_size)
                         
-                        # Record volume (approx $10 per trade)
-                        TRADING_VOLUME_USDT.labels(symbol=symbol).inc(10.0)
+                        # Update Prometheus
+                        TRADES_TOTAL.labels(symbol=symbol, side='buy').inc()
                         
                         if not self.paper_mode:
                             await exchange.create_order(symbol, 'market', 'buy', self.position_size)
@@ -277,42 +373,29 @@ class GrokApexIroncladBot:
                             'entry_score': score
                         }
                         HYBRID_POSITION_STATUS.labels(symbol=symbol).set(1)
-                        OPEN_POSITIONS_COUNT.set(len(self.positions))
                         self.save_state()
                     
                     # ========== SELL SIGNAL ==========
                     elif score < self.sell_threshold and symbol in self.positions:
                         entry_price = self.positions[symbol]['price']
-                        entry_score = self.positions[symbol].get('entry_score', 0)
                         pnl_pct = ((price - entry_price) / entry_price) * 100
-                        
-                        # Calculate P&L in USDT (approx $10 position)
                         pnl_usdt = (price - entry_price) / entry_price * 10.0
+                        self.total_pnl += pnl_usdt
                         
-                        # Update running P&L
-                        self.symbol_pnl[symbol] = self.symbol_pnl.get(symbol, 0.0) + pnl_usdt
-                        self.total_trades_count += 1
-                        if pnl_usdt > 0:
-                            self.winning_trades_count += 1
+                        logger.info(f"🔴 SELL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usdt:.2f}) | Total PnL: ${self.total_pnl:.2f}")
                         
-                        win_rate = (self.winning_trades_count / self.total_trades_count * 100) if self.total_trades_count > 0 else 0
+                        # Update database with exit info
+                        if self.db_enabled:
+                            update_trade_exit(symbol, price, pnl_pct, pnl_usdt)
                         
-                        logger.info(f"🔴 SELL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usdt:.2f}) | Win Rate: {win_rate:.1f}%")
-                        
-                        # Record sell trade metric
+                        # Update Prometheus
                         TRADES_TOTAL.labels(symbol=symbol, side='sell').inc()
-                        TRADING_VOLUME_USDT.labels(symbol=symbol).inc(10.0)
-                        
-                        # Update metrics
                         HYBRID_LAST_PNL_PCT.labels(symbol=symbol).set(pnl_pct)
-                        RUNNING_PNL_USDT.labels(symbol=symbol).set(self.symbol_pnl[symbol])
-                        HYBRID_POSITION_STATUS.labels(symbol=symbol).set(0)
-                        TOTAL_PNL_USDT.set(sum(self.symbol_pnl.values()))
-                        OPEN_POSITIONS_COUNT.set(len(self.positions) - 1)
                         
                         if not self.paper_mode:
                             await exchange.create_order(symbol, 'market', 'sell', self.position_size)
                         
+                        HYBRID_POSITION_STATUS.labels(symbol=symbol).set(0)
                         del self.positions[symbol]
                         self.save_state()
                         
@@ -327,9 +410,7 @@ class GrokApexIroncladBot:
         self.running = False
         self.save_state()
         logger.info("=" * 60)
-        logger.info("🛑 Bot stopped")
-        logger.info(f"📊 Final Stats - Total Trades: {self.total_trades_count}, Winning: {self.winning_trades_count}")
-        logger.info(f"💰 Final P&L: ${sum(self.symbol_pnl.values()):.2f}")
+        logger.info(f"🛑 Bot stopped | Total PnL: ${self.total_pnl:.2f}")
         logger.info("=" * 60)
 
 
