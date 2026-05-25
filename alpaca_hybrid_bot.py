@@ -1,160 +1,50 @@
-#!/usr/bin/env python3
-# GROK_OKX_APEX_V8 - HYBRID STRATEGY (WITH POSTGRESQL TRADING DASHBOARD)
+# Alpaca Hybrid Trading Bot
 
 import asyncio
-import ccxt.pro as ccxtpro
+import alpaca_trade_api as tradeapi
 import pandas as pd
 import numpy as np
 import logging
 import json
 import os
 import time
+import csv
 from datetime import datetime
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# POSTGRESQL DATABASE SETUP
+# CSV TRADE LOGGING
 # ==============================================================================
 
-def init_database():
-    """Initialize PostgreSQL database and create trades table"""
-    try:
-        conn = psycopg2.connect(
-            host="postgresql",
-            database="grafana",
-            user="grafana",
-            password="grafana"
-        )
-        cur = conn.cursor()
-        
-        # Create trades table (similar to TradeLab's structure)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id SERIAL PRIMARY KEY,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                symbol VARCHAR(20),
-                side VARCHAR(10),
-                entry_price DECIMAL(20, 8),
-                exit_price DECIMAL(20, 8),
-                quantity DECIMAL(20, 8),
-                pnl_pct DECIMAL(10, 4),
-                pnl_usdt DECIMAL(20, 4),
-                score DECIMAL(10, 4),
-                status VARCHAR(20) DEFAULT 'OPEN'
-            )
-        """)
-        
-        # Create strategy_scores table for tracking predictions
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS strategy_scores (
-                id SERIAL PRIMARY KEY,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                symbol VARCHAR(20),
-                score DECIMAL(10, 4),
-                price DECIMAL(20, 8)
-            )
-        """)
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info("✅ PostgreSQL database initialized successfully")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
-        logger.warning("⚠️  Continuing without database - trades will not be saved")
-        return False
+def init_csv():
+    """Initialize CSV file with headers"""
+    if not os.path.exists('trades.csv'):
+        with open('trades.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Timestamp', 'Symbol', 'Side', 'Price', 'PnL_USD', 'Total_PnL_USD', 'Score'])
 
-def save_trade(symbol, side, price, score, quantity=0.01):
-    """Save a trade to PostgreSQL"""
-    try:
-        conn = psycopg2.connect(
-            host="postgresql",
-            database="grafana",
-            user="grafana",
-            password="grafana"
-        )
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO trades (symbol, side, entry_price, score, quantity, status)
-            VALUES (%s, %s, %s, %s, %s, 'OPEN')
-        """, (symbol, side, price, score, quantity))
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info(f"💾 Trade saved to database: {side} {symbol} @ ${price:.2f}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save trade: {e}")
-        return False
-
-def update_trade_exit(symbol, exit_price, pnl_pct, pnl_usdt):
-    """Update an open trade with exit information"""
-    try:
-        conn = psycopg2.connect(
-            host="postgresql",
-            database="grafana",
-            user="grafana",
-            password="grafana"
-        )
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE trades 
-            SET exit_price = %s, pnl_pct = %s, pnl_usdt = %s, status = 'CLOSED'
-            WHERE symbol = %s AND side = 'BUY' AND status = 'OPEN'
-            ORDER BY timestamp DESC LIMIT 1
-        """, (exit_price, pnl_pct, pnl_usdt, symbol))
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info(f"💾 Trade exit saved: {symbol} PnL: {pnl_pct:.2f}%")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update trade exit: {e}")
-        return False
-
-def save_strategy_score(symbol, score, price):
-    """Save strategy score for historical analysis"""
-    try:
-        conn = psycopg2.connect(
-            host="postgresql",
-            database="grafana",
-            user="grafana",
-            password="grafana"
-        )
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO strategy_scores (symbol, score, price)
-            VALUES (%s, %s, %s)
-        """, (symbol, score, price))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        pass  # Silent fail for scores - not critical
+def write_trade_to_csv(symbol, side, price, pnl_usd=None, total_pnl=None, score=None):
+    """Write a trade to CSV file"""
+    with open('trades.csv', 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            symbol,
+            side,
+            price,
+            pnl_usd if pnl_usd is not None else '',
+            total_pnl if total_pnl is not None else '',
+            score if score is not None else ''
+        ])
 
 # ==============================================================================
-# PROMETHEUS METRICS (Keep for compatibility)
-# ==============================================================================
-
-from prometheus_client import start_http_server, Gauge, Counter
-
-HYBRID_STRATEGY_SCORE = Gauge('hybrid_strategy_score', 'Latest strategy prediction score', ['symbol'])
-HYBRID_POSITION_STATUS = Gauge('hybrid_position_status', 'Active position status', ['symbol'])
-HYBRID_LAST_PNL_PCT = Gauge('hybrid_last_pnl_pct', 'PnL % of last closed trade', ['symbol'])
-TRADES_TOTAL = Counter('trading_trades_total', 'Total number of trades executed', ['symbol', 'side'])
-
-# ==============================================================================
-# HYBRID PREDICTOR (Your existing strategy)
+# HYBRID PREDICTOR
 # ==============================================================================
 
 class HybridPredictor:
     def __init__(self):
-        self.regime = "neutral"
         self.score_history = []
         
     def predict(self, df):
@@ -239,172 +129,202 @@ class HybridPredictor:
         return ema
 
 # ==============================================================================
-# MAIN BOT CLASS
+# MAIN ALPACA BOT CLASS
 # ==============================================================================
 
-class GrokApexIroncladBot:
+class AlpacaHybridBot:
     def __init__(self, paper_mode: bool = True, interval_minutes: int = 5):
         self.paper_mode = paper_mode
         self.interval_minutes = interval_minutes
         
-        # Lowered thresholds for more trading activity
         self.buy_threshold = 0.51
         self.sell_threshold = 0.49
-        self.position_size = 0.01
+        self.position_size = 100  # Dollar amount per trade
         
-        self.api_key = os.getenv("OKX_API_KEY", "")
-        self.secret = os.getenv("OKX_SECRET_KEY", "")
-        self.passphrase = os.getenv("OKX_PASSPHRASE", "")
+        # Alpaca API keys from environment
+        self.api_key = os.getenv("APCA_API_KEY_ID", "")
+        self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
         
-        self.symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
+        if not self.api_key or not self.secret_key:
+            logger.warning("⚠️ Alpaca API keys not set. Bot will run in analysis-only mode.")
+        
+        # Alpaca endpoints
+        if paper_mode:
+            self.base_url = "https://paper-api.alpaca.markets"
+        else:
+            self.base_url = "https://api.alpaca.markets"
+        
+        # Stock symbols to trade
+        self.symbols = ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN']
+        
         self.ml = HybridPredictor()
         self.positions = {}
         self.trades = []
         self.running = True
         self.total_pnl = 0.0
         
-        # Initialize database
-        self.db_enabled = init_database()
-        
-        # Start Prometheus metrics (optional, on port 3000)
-        try:
-            start_http_server(3000)
-            logger.info("📊 Prometheus metrics available on port 3000")
-        except Exception as e:
-            logger.warning(f"Could not start Prometheus server: {e}")
+        # Initialize CSV
+        init_csv()
+        logger.info("📊 CSV logging initialized: trades.csv")
         
         self.load_state()
 
     def load_state(self):
-        if os.path.exists("grok_apex_state.json"):
+        if os.path.exists("alpaca_state.json"):
             try:
-                with open("grok_apex_state.json", "r") as f:
+                with open("alpaca_state.json", "r") as f:
                     data = json.load(f)
                     self.positions = data.get("positions", {})
                     self.trades = data.get("trades", [])
-            except:
-                pass
+                    self.total_pnl = data.get("total_pnl", 0.0)
+            except Exception as e:
+                logger.warning(f"Load state failed: {e}")
 
     def save_state(self):
         try:
-            with open("grok_apex_state.json", "w") as f:
-                json.dump({"positions": self.positions, "trades": self.trades[-100:]}, f)
-        except:
-            pass
-
-    async def fetch_symbol_data(self, exchange, symbol):
-        try:
-            ticker = await exchange.watch_ticker(symbol)
-            price = ticker['last']
-            ohlcv = await exchange.fetch_ohlcv(symbol, '5m', limit=100)
-            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
-            return symbol, price, df
+            with open("alpaca_state.json", "w") as f:
+                json.dump({
+                    "positions": self.positions,
+                    "trades": self.trades[-100:],
+                    "total_pnl": self.total_pnl
+                }, f)
         except Exception as e:
-            logger.error(f"Error fetching data for {symbol}: {e}")
-            return symbol, None, None
+            logger.warning(f"Save state failed: {e}")
 
-    async def wait_for_next_even_interval(self):
-        now = time.time()
-        interval_seconds = self.interval_minutes * 60
-        time_to_sleep = interval_seconds - (now % interval_seconds)
-        await asyncio.sleep(time_to_sleep)
+    def get_api(self):
+        """Get Alpaca API client"""
+        if not self.api_key or not self.secret_key:
+            return None
+        return tradeapi.REST(self.api_key, self.secret_key, base_url=self.base_url)
+
+    def fetch_historical_data(self, symbol):
+        """Fetch historical data from Alpaca"""
+        try:
+            api = self.get_api()
+            if api is None:
+                return None, None
+            
+            # Get 5-minute bars
+            bars = api.get_bars(
+                symbol,
+                timeframe='5Min',
+                limit=100
+            ).df
+            
+            if bars.empty:
+                return None, None
+            
+            df = pd.DataFrame({
+                'close': bars['close'],
+                'volume': bars['volume']
+            })
+            
+            current_price = bars['close'].iloc[-1]
+            
+            return current_price, df
+            
+        except Exception as e:
+            logger.error(f"Error fetching {symbol}: {e}")
+            return None, None
+
+    def get_position_qty(self, symbol):
+        """Get current position quantity"""
+        try:
+            api = self.get_api()
+            if api is None:
+                return 0
+            position = api.get_position(symbol)
+            return float(position.qty)
+        except:
+            return 0
 
     async def run(self):
-        exchange = ccxtpro.okx({
-            'apiKey': self.api_key,
-            'secret': self.secret,
-            'password': self.passphrase,
-            'hostname': os.getenv('OKX_DOMAIN', 'www.okx.com'),
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        })
-        
-        if self.paper_mode:
-            exchange.set_sandbox_mode(True)
-            logger.info("=" * 60)
-            logger.info("🚀 PAPER TRADING MODE - HYBRID STRATEGY")
-            logger.info(f"🎯 Buy Threshold: {self.buy_threshold} | Sell: {self.sell_threshold}")
-            logger.info(f"💾 Database enabled: {self.db_enabled}")
-            logger.info("=" * 60)
-        
-        await exchange.load_markets()
-        logger.info(f"📈 Tracking {len(self.symbols)} symbols")
+        logger.info("=" * 60)
+        logger.info("🚀 ALPACA PAPER TRADING MODE - HYBRID STRATEGY")
+        logger.info(f"🎯 Buy Threshold: {self.buy_threshold} | Sell: {self.sell_threshold}")
+        logger.info(f"📊 Symbols: {', '.join(self.symbols)}")
+        logger.info("=" * 60)
         
         while self.running:
-            await self.wait_for_next_even_interval()
-            
-            tasks = [self.fetch_symbol_data(exchange, symbol) for symbol in self.symbols]
-            results = await asyncio.gather(*tasks)
-            
-            for symbol, price, df in results:
-                if price is None or df is None:
-                    continue
+            try:
+                # Wait for next interval
+                now = time.time()
+                interval_seconds = self.interval_minutes * 60
+                time_to_sleep = interval_seconds - (now % interval_seconds)
+                await asyncio.sleep(max(1, time_to_sleep))
                 
-                try:
-                    score = self.ml.predict(df)
+                for symbol in self.symbols:
+                    try:
+                        # Get data
+                        price, df = self.fetch_historical_data(symbol)
+                        
+                        if price is None or df is None:
+                            continue
+                        
+                        score = self.ml.predict(df)
+                        current_position = self.get_position_qty(symbol)
+                        
+                        logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Position: {current_position}")
+                        
+                        # ========== BUY SIGNAL ==========
+                        if score > self.buy_threshold and current_position == 0:
+                            logger.info(f"🟢 BUY SIGNAL: {symbol} @ ${price:.2f} (Score: {score:.3f})")
+                            
+                            write_trade_to_csv(symbol, 'BUY', price, score=score)
+                            
+                            if not self.paper_mode and self.api_key:
+                                api = self.get_api()
+                                shares = int(self.position_size / price)
+                                if shares > 0:
+                                    api.submit_order(
+                                        symbol=symbol,
+                                        qty=shares,
+                                        side='buy',
+                                        type='market',
+                                        time_in_force='day'
+                                    )
+                            
+                            self.positions[symbol] = {
+                                'price': price,
+                                'entry_time': datetime.now().isoformat(),
+                                'entry_score': score
+                            }
+                            self.save_state()
+                        
+                        # ========== SELL SIGNAL ==========
+                        elif score < self.sell_threshold and current_position > 0:
+                            entry_price = self.positions[symbol]['price'] if symbol in self.positions else price
+                            pnl_pct = ((price - entry_price) / entry_price) * 100
+                            pnl_usd = (price - entry_price) / entry_price * self.position_size
+                            self.total_pnl += pnl_usd
+                            
+                            logger.info(f"🔴 SELL SIGNAL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usd:.2f}) | Total: ${self.total_pnl:.2f}")
+                            
+                            write_trade_to_csv(symbol, 'SELL', price, pnl_usd, self.total_pnl, score)
+                            
+                            if not self.paper_mode and self.api_key:
+                                api = self.get_api()
+                                api.submit_order(
+                                    symbol=symbol,
+                                    qty=current_position,
+                                    side='sell',
+                                    type='market',
+                                    time_in_force='day'
+                                )
+                            
+                            if symbol in self.positions:
+                                del self.positions[symbol]
+                            self.save_state()
                     
-                    logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f}")
-                    
-                    # Save score to database
-                    if self.db_enabled:
-                        save_strategy_score(symbol, score, price)
-                    
-                    # Update Prometheus
-                    HYBRID_STRATEGY_SCORE.labels(symbol=symbol).set(score)
-                    
-                    # ========== BUY SIGNAL ==========
-                    if score > self.buy_threshold and symbol not in self.positions:
-                        logger.info(f"🟢 BUY: {symbol} @ ${price:.2f} (Score: {score:.3f})")
-                        
-                        # Save to database
-                        if self.db_enabled:
-                            save_trade(symbol, 'BUY', price, score, self.position_size)
-                        
-                        # Update Prometheus
-                        TRADES_TOTAL.labels(symbol=symbol, side='buy').inc()
-                        
-                        if not self.paper_mode:
-                            await exchange.create_order(symbol, 'market', 'buy', self.position_size)
-                        
-                        self.positions[symbol] = {
-                            'price': price, 
-                            'entry_time': datetime.now().isoformat(),
-                            'entry_score': score
-                        }
-                        HYBRID_POSITION_STATUS.labels(symbol=symbol).set(1)
-                        self.save_state()
-                    
-                    # ========== SELL SIGNAL ==========
-                    elif score < self.sell_threshold and symbol in self.positions:
-                        entry_price = self.positions[symbol]['price']
-                        pnl_pct = ((price - entry_price) / entry_price) * 100
-                        pnl_usdt = (price - entry_price) / entry_price * 10.0
-                        self.total_pnl += pnl_usdt
-                        
-                        logger.info(f"🔴 SELL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usdt:.2f}) | Total PnL: ${self.total_pnl:.2f}")
-                        
-                        # Update database with exit info
-                        if self.db_enabled:
-                            update_trade_exit(symbol, price, pnl_pct, pnl_usdt)
-                        
-                        # Update Prometheus
-                        TRADES_TOTAL.labels(symbol=symbol, side='sell').inc()
-                        HYBRID_LAST_PNL_PCT.labels(symbol=symbol).set(pnl_pct)
-                        
-                        if not self.paper_mode:
-                            await exchange.create_order(symbol, 'market', 'sell', self.position_size)
-                        
-                        HYBRID_POSITION_STATUS.labels(symbol=symbol).set(0)
-                        del self.positions[symbol]
-                        self.save_state()
-                        
-                except Exception as e:
-                    logger.error(f"Error processing {symbol}: {e}")
-            
-            await asyncio.sleep(1)
+                    except Exception as e:
+                        logger.error(f"Error processing {symbol}: {e}")
+                
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                await asyncio.sleep(5)
         
-        await exchange.close()
-
     def stop(self):
         self.running = False
         self.save_state()
@@ -412,13 +332,16 @@ class GrokApexIroncladBot:
         logger.info(f"🛑 Bot stopped | Total PnL: ${self.total_pnl:.2f}")
         logger.info("=" * 60)
 
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
 
 if __name__ == "__main__":
     paper_mode = os.getenv('PAPER_MODE', 'true').lower() == 'true'
-    bot = GrokApexIroncladBot(paper_mode=paper_mode, interval_minutes=5)
+    bot = AlpacaHybridBot(paper_mode=paper_mode, interval_minutes=5)
     
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         bot.stop()
-        logger.info("Shutdown complete")    fix the code if you can
+        logger.info("Shutdown complete")
