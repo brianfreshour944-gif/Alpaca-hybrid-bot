@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # GROK_OKX_APEX_V8 - HYBRID STRATEGY (WITH POSTGRESQL TRADING DASHBOARD)
 
@@ -422,4 +421,4 @@ if __name__ == "__main__":
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         bot.stop()
-        logger.info("Shutdown complete")
+        logger.info("Shutdown complete")    fix the code if you can
