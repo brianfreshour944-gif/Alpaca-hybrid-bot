@@ -146,7 +146,7 @@ class AlpacaCryptoBot:
         
         self.buy_threshold = 0.51
         self.sell_threshold = 0.49
-        self.position_usd = 25  # $25 per crypto trade (small for testing)
+        self.position_usd = 25  # $25 per crypto trade
         
         # Alpaca API keys from environment
         self.api_key = os.getenv("APCA_API_KEY_ID", "")
@@ -161,11 +161,10 @@ class AlpacaCryptoBot:
         
         if self.api_key and self.secret_key:
             self.trading_client = TradingClient(self.api_key, self.secret_key, paper=paper_mode)
-            # Crypto uses CryptoHistoricalDataClient
             self.data_client = CryptoHistoricalDataClient(self.api_key, self.secret_key)
         
-        # Crypto symbols (Alpaca supports these)
-        self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'LTC/USD']
+        # Crypto symbols - USE USDT PAIRS (Alpaca requires this format)
+        self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'LTC/USDT']
         
         self.ml = HybridPredictor()
         self.positions = {}
@@ -205,10 +204,11 @@ class AlpacaCryptoBot:
         """Get current position quantity for crypto"""
         try:
             if self.trading_client:
-                # Get all positions
+                # Format symbol for Alpaca (remove slash)
+                alpaca_symbol = symbol.replace('/', '')
                 positions = self.trading_client.get_all_positions()
                 for pos in positions:
-                    if pos.symbol == symbol.replace('/', ''):
+                    if pos.symbol == alpaca_symbol:
                         return float(pos.qty)
         except:
             pass
@@ -225,7 +225,7 @@ class AlpacaCryptoBot:
             
             order_data = MarketOrderRequest(
                 symbol=alpaca_symbol,
-                notional=usd_amount,  # Use notional for crypto (buy by USD amount)
+                notional=usd_amount,
                 side=OrderSide.BUY if side == 'buy' else OrderSide.SELL,
                 time_in_force=TimeInForce.DAY
             )
@@ -242,7 +242,7 @@ class AlpacaCryptoBot:
             if not self.data_client:
                 return None, None
             
-            # Format symbol for Alpaca
+            # Format symbol for Alpaca (remove slash)
             alpaca_symbol = symbol.replace('/', '')
             
             request = CryptoBarsRequest(
@@ -299,7 +299,7 @@ class AlpacaCryptoBot:
                         score = self.ml.predict(df)
                         current_position = self.get_position_qty(symbol)
                         
-                        logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Position: {current_position:.4f}")
+                        logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Position: {current_position:.8f}")
                         
                         # ========== BUY SIGNAL ==========
                         if score > self.buy_threshold and current_position == 0:
