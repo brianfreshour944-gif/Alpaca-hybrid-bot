@@ -1,7 +1,6 @@
-# Alpaca Hybrid Trading Bot
+# Alpaca Hybrid Trading Bot - Using Official SDK
 
 import asyncio
-import alpaca_trade_api as tradeapi
 import pandas as pd
 import numpy as np
 import logging
@@ -9,7 +8,15 @@ import json
 import os
 import time
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# Alpaca SDK imports
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -139,7 +146,7 @@ class AlpacaHybridBot:
         
         self.buy_threshold = 0.51
         self.sell_threshold = 0.49
-        self.position_size = 100  # Dollar amount per trade
+        self.position_value = 100  # Dollar amount per trade
         
         # Alpaca API keys from environment
         self.api_key = os.getenv("APCA_API_KEY_ID", "")
@@ -148,11 +155,13 @@ class AlpacaHybridBot:
         if not self.api_key or not self.secret_key:
             logger.warning("⚠️ Alpaca API keys not set. Bot will run in analysis-only mode.")
         
-        # Alpaca endpoints
-        if paper_mode:
-            self.base_url = "https://paper-api.alpaca.markets"
-        else:
-            self.base_url = "https://api.alpaca.markets"
+        # Initialize Alpaca clients
+        self.trading_client = None
+        self.data_client = None
+        
+        if self.api_key and self.secret_key:
+            self.trading_client = TradingClient(self.api_key, self.secret_key, paper=paper_mode)
+            self.data_client = StockHistoricalDataClient(self.api_key, self.secret_key)
         
         # Stock symbols to trade
         self.symbols = ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN']
@@ -191,52 +200,93 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.warning(f"Save state failed: {e}")
 
-    def get_api(self):
-        """Get Alpaca API client"""
-        if not self.api_key or not self.secret_key:
-            return None
-        return tradeapi.REST(self.api_key, self.secret_key, base_url=self.base_url)
+    def get_account_info(self):
+        """Get account balance"""
+        try:
+            if self.trading_client:
+                account = self.trading_client.get_account()
+                return float(account.buying_power)
+        except Exception as e:
+            logger.error(f"Error getting account: {e}")
+        return 0
 
-    def fetch_historical_data(self, symbol):
+    def get_position_qty(self, symbol):
+        """Get current position quantity"""
+        try:
+            if self.trading_client:
+                position = self.trading_client.get_position(symbol)
+                return float(position.qty)
+        except:
+            return 0
+        return 0
+
+    def get_current_price(self, symbol):
+        """Get current price for a symbol"""
+        try:
+            if self.data_client:
+                request = StockBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=TimeFrame.Minute,
+                    start=datetime.now() - timedelta(minutes=5),
+                    limit=1
+                )
+                bars = self.data_client.get_stock_bars(request)
+                if bars.data and symbol in bars.data:
+                    return bars.data[symbol][-1].close
+        except Exception as e:
+            logger.error(f"Error getting price for {symbol}: {e}")
+        return None
+
+    def submit_order(self, symbol, qty, side):
+        """Submit an order to Alpaca"""
+        try:
+            if not self.trading_client:
+                return False
+            
+            order_data = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY if side == 'buy' else OrderSide.SELL,
+                time_in_force=TimeInForce.DAY
+            )
+            order = self.trading_client.submit_order(order_data)
+            logger.info(f"✅ Order placed: {side.upper()} {qty} shares of {symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"Order failed: {e}")
+            return False
+
+    async def fetch_historical_data(self, symbol):
         """Fetch historical data from Alpaca"""
         try:
-            api = self.get_api()
-            if api is None:
+            if not self.data_client:
                 return None, None
             
-            # Get 5-minute bars
-            bars = api.get_bars(
-                symbol,
-                timeframe='5Min',
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                start=datetime.now() - timedelta(days=1),
                 limit=100
-            ).df
+            )
+            bars = self.data_client.get_stock_bars(request)
             
-            if bars.empty:
+            if not bars.data or symbol not in bars.data:
                 return None, None
+            
+            bars_list = bars.data[symbol]
             
             df = pd.DataFrame({
-                'close': bars['close'],
-                'volume': bars['volume']
+                'close': [bar.close for bar in bars_list],
+                'volume': [bar.volume for bar in bars_list]
             })
             
-            current_price = bars['close'].iloc[-1]
+            current_price = bars_list[-1].close
             
             return current_price, df
             
         except Exception as e:
             logger.error(f"Error fetching {symbol}: {e}")
             return None, None
-
-    def get_position_qty(self, symbol):
-        """Get current position quantity"""
-        try:
-            api = self.get_api()
-            if api is None:
-                return 0
-            position = api.get_position(symbol)
-            return float(position.qty)
-        except:
-            return 0
 
     async def run(self):
         logger.info("=" * 60)
@@ -256,7 +306,7 @@ class AlpacaHybridBot:
                 for symbol in self.symbols:
                     try:
                         # Get data
-                        price, df = self.fetch_historical_data(symbol)
+                        price, df = await self.fetch_historical_data(symbol)
                         
                         if price is None or df is None:
                             continue
@@ -268,49 +318,37 @@ class AlpacaHybridBot:
                         
                         # ========== BUY SIGNAL ==========
                         if score > self.buy_threshold and current_position == 0:
-                            logger.info(f"🟢 BUY SIGNAL: {symbol} @ ${price:.2f} (Score: {score:.3f})")
-                            
-                            write_trade_to_csv(symbol, 'BUY', price, score=score)
-                            
-                            if not self.paper_mode and self.api_key:
-                                api = self.get_api()
-                                shares = int(self.position_size / price)
-                                if shares > 0:
-                                    api.submit_order(
-                                        symbol=symbol,
-                                        qty=shares,
-                                        side='buy',
-                                        type='market',
-                                        time_in_force='day'
-                                    )
-                            
-                            self.positions[symbol] = {
-                                'price': price,
-                                'entry_time': datetime.now().isoformat(),
-                                'entry_score': score
-                            }
-                            self.save_state()
+                            shares = int(self.position_value / price)
+                            if shares > 0:
+                                logger.info(f"🟢 BUY: {symbol} @ ${price:.2f} - {shares} shares (Score: {score:.3f})")
+                                
+                                write_trade_to_csv(symbol, 'BUY', price, score=score)
+                                
+                                if not self.paper_mode:
+                                    self.submit_order(symbol, shares, 'buy')
+                                
+                                self.positions[symbol] = {
+                                    'price': price,
+                                    'shares': shares,
+                                    'entry_time': datetime.now().isoformat(),
+                                    'entry_score': score
+                                }
+                                self.save_state()
                         
                         # ========== SELL SIGNAL ==========
                         elif score < self.sell_threshold and current_position > 0:
                             entry_price = self.positions[symbol]['price'] if symbol in self.positions else price
+                            shares = self.positions[symbol].get('shares', current_position) if symbol in self.positions else current_position
                             pnl_pct = ((price - entry_price) / entry_price) * 100
-                            pnl_usd = (price - entry_price) / entry_price * self.position_size
+                            pnl_usd = (price - entry_price) / entry_price * (shares * entry_price)
                             self.total_pnl += pnl_usd
                             
-                            logger.info(f"🔴 SELL SIGNAL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usd:.2f}) | Total: ${self.total_pnl:.2f}")
+                            logger.info(f"🔴 SELL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usd:.2f}) | Total: ${self.total_pnl:.2f}")
                             
                             write_trade_to_csv(symbol, 'SELL', price, pnl_usd, self.total_pnl, score)
                             
-                            if not self.paper_mode and self.api_key:
-                                api = self.get_api()
-                                api.submit_order(
-                                    symbol=symbol,
-                                    qty=current_position,
-                                    side='sell',
-                                    type='market',
-                                    time_in_force='day'
-                                )
+                            if not self.paper_mode:
+                                self.submit_order(symbol, shares, 'sell')
                             
                             if symbol in self.positions:
                                 del self.positions[symbol]
