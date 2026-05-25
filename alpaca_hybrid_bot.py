@@ -163,8 +163,8 @@ class AlpacaCryptoBot:
             self.trading_client = TradingClient(self.api_key, self.secret_key, paper=paper_mode)
             self.data_client = CryptoHistoricalDataClient(self.api_key, self.secret_key)
         
-        # Crypto symbols - USE USDT PAIRS (Alpaca requires this format)
-        self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'LTC/USDT']
+        # Crypto symbols - Use USD pairs (Alpaca's official format)
+        self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'LTC/USD']
         
         self.ml = HybridPredictor()
         self.positions = {}
@@ -204,14 +204,14 @@ class AlpacaCryptoBot:
         """Get current position quantity for crypto"""
         try:
             if self.trading_client:
-                # Format symbol for Alpaca (remove slash)
+                # Format: Remove slash for position lookup (BTCUSD not BTC/USD)
                 alpaca_symbol = symbol.replace('/', '')
                 positions = self.trading_client.get_all_positions()
                 for pos in positions:
                     if pos.symbol == alpaca_symbol:
                         return float(pos.qty)
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Position check failed for {symbol}: {e}")
         return 0
 
     def submit_crypto_order(self, symbol, usd_amount, side):
@@ -220,7 +220,7 @@ class AlpacaCryptoBot:
             if not self.trading_client:
                 return False
             
-            # Format symbol for Alpaca (remove slash)
+            # Format symbol for Alpaca (remove slash for order API)
             alpaca_symbol = symbol.replace('/', '')
             
             order_data = MarketOrderRequest(
@@ -242,21 +242,19 @@ class AlpacaCryptoBot:
             if not self.data_client:
                 return None, None
             
-            # Format symbol for Alpaca (remove slash)
-            alpaca_symbol = symbol.replace('/', '')
-            
+            # For historical data, keep the slash format
             request = CryptoBarsRequest(
-                symbol_or_symbols=alpaca_symbol,
+                symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Minute,
                 start=datetime.now() - timedelta(days=1),
                 limit=100
             )
             bars = self.data_client.get_crypto_bars(request)
             
-            if not bars.data or alpaca_symbol not in bars.data:
+            if not bars.data or symbol not in bars.data:
                 return None, None
             
-            bars_list = bars.data[alpaca_symbol]
+            bars_list = bars.data[symbol]
             
             df = pd.DataFrame({
                 'close': [bar.close for bar in bars_list],
