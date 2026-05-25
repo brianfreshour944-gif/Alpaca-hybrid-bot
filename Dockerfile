@@ -7,5 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY alpaca_hybrid_bot.py .
 
-# Run the bot
 CMD ["python", "-u", "alpaca_hybrid_bot.py"]
