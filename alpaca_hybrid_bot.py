@@ -1,4 +1,4 @@
-# Alpaca Hybrid Trading Bot - Using Official SDK
+# Alpaca Crypto Hybrid Trading Bot
 
 import asyncio
 import pandas as pd
@@ -10,12 +10,12 @@ import time
 import csv
 from datetime import datetime, timedelta
 
-# Alpaca SDK imports
+# Alpaca SDK imports for crypto
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -136,17 +136,17 @@ class HybridPredictor:
         return ema
 
 # ==============================================================================
-# MAIN ALPACA BOT CLASS
+# MAIN ALPACA CRYPTO BOT CLASS
 # ==============================================================================
 
-class AlpacaHybridBot:
+class AlpacaCryptoBot:
     def __init__(self, paper_mode: bool = True, interval_minutes: int = 5):
         self.paper_mode = paper_mode
         self.interval_minutes = interval_minutes
         
         self.buy_threshold = 0.51
         self.sell_threshold = 0.49
-        self.position_value = 100  # Dollar amount per trade
+        self.position_usd = 25  # $25 per crypto trade (small for testing)
         
         # Alpaca API keys from environment
         self.api_key = os.getenv("APCA_API_KEY_ID", "")
@@ -161,10 +161,11 @@ class AlpacaHybridBot:
         
         if self.api_key and self.secret_key:
             self.trading_client = TradingClient(self.api_key, self.secret_key, paper=paper_mode)
-            self.data_client = StockHistoricalDataClient(self.api_key, self.secret_key)
+            # Crypto uses CryptoHistoricalDataClient
+            self.data_client = CryptoHistoricalDataClient(self.api_key, self.secret_key)
         
-        # Stock symbols to trade
-        self.symbols = ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN']
+        # Crypto symbols (Alpaca supports these)
+        self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'LTC/USD']
         
         self.ml = HybridPredictor()
         self.positions = {}
@@ -179,9 +180,9 @@ class AlpacaHybridBot:
         self.load_state()
 
     def load_state(self):
-        if os.path.exists("alpaca_state.json"):
+        if os.path.exists("alpaca_crypto_state.json"):
             try:
-                with open("alpaca_state.json", "r") as f:
+                with open("alpaca_crypto_state.json", "r") as f:
                     data = json.load(f)
                     self.positions = data.get("positions", {})
                     self.trades = data.get("trades", [])
@@ -191,7 +192,7 @@ class AlpacaHybridBot:
 
     def save_state(self):
         try:
-            with open("alpaca_state.json", "w") as f:
+            with open("alpaca_crypto_state.json", "w") as f:
                 json.dump({
                     "positions": self.positions,
                     "trades": self.trades[-100:],
@@ -200,80 +201,62 @@ class AlpacaHybridBot:
         except Exception as e:
             logger.warning(f"Save state failed: {e}")
 
-    def get_account_info(self):
-        """Get account balance"""
-        try:
-            if self.trading_client:
-                account = self.trading_client.get_account()
-                return float(account.buying_power)
-        except Exception as e:
-            logger.error(f"Error getting account: {e}")
-        return 0
-
     def get_position_qty(self, symbol):
-        """Get current position quantity"""
+        """Get current position quantity for crypto"""
         try:
             if self.trading_client:
-                position = self.trading_client.get_position(symbol)
-                return float(position.qty)
+                # Get all positions
+                positions = self.trading_client.get_all_positions()
+                for pos in positions:
+                    if pos.symbol == symbol.replace('/', ''):
+                        return float(pos.qty)
         except:
-            return 0
+            pass
         return 0
 
-    def get_current_price(self, symbol):
-        """Get current price for a symbol"""
-        try:
-            if self.data_client:
-                request = StockBarsRequest(
-                    symbol_or_symbols=symbol,
-                    timeframe=TimeFrame.Minute,
-                    start=datetime.now() - timedelta(minutes=5),
-                    limit=1
-                )
-                bars = self.data_client.get_stock_bars(request)
-                if bars.data and symbol in bars.data:
-                    return bars.data[symbol][-1].close
-        except Exception as e:
-            logger.error(f"Error getting price for {symbol}: {e}")
-        return None
-
-    def submit_order(self, symbol, qty, side):
-        """Submit an order to Alpaca"""
+    def submit_crypto_order(self, symbol, usd_amount, side):
+        """Submit a crypto order using USD amount"""
         try:
             if not self.trading_client:
                 return False
             
+            # Format symbol for Alpaca (remove slash)
+            alpaca_symbol = symbol.replace('/', '')
+            
             order_data = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
+                symbol=alpaca_symbol,
+                notional=usd_amount,  # Use notional for crypto (buy by USD amount)
                 side=OrderSide.BUY if side == 'buy' else OrderSide.SELL,
                 time_in_force=TimeInForce.DAY
             )
             order = self.trading_client.submit_order(order_data)
-            logger.info(f"✅ Order placed: {side.upper()} {qty} shares of {symbol}")
+            logger.info(f"✅ Order placed: {side.upper()} ${usd_amount} of {symbol}")
             return True
         except Exception as e:
             logger.error(f"Order failed: {e}")
             return False
 
-    async def fetch_historical_data(self, symbol):
-        """Fetch historical data from Alpaca"""
+    async def fetch_crypto_data(self, symbol):
+        """Fetch historical crypto data from Alpaca"""
         try:
             if not self.data_client:
                 return None, None
             
-            request = StockBarsRequest(
-                symbol_or_symbols=symbol,
+            # Format symbol for Alpaca
+            alpaca_symbol = symbol.replace('/', '')
+            
+            request = CryptoBarsRequest(
+                symbol_or_symbols=alpaca_symbol,
                 timeframe=TimeFrame.Minute,
                 start=datetime.now() - timedelta(days=1),
                 limit=100
             )
-            bars = self.data_client.get_stock_bars(request)
+            bars = self.data_client.get_crypto_bars(request)
             
-            if not bars.data or symbol not in bars.data:
+            if not bars.data or alpaca_symbol not in bars.data:
                 return None, None
             
-            bars_list = bars.data[symbol]
+            bars_list = bars.data[alpaca_symbol]
             
             df = pd.DataFrame({
                 'close': [bar.close for bar in bars_list],
@@ -290,8 +273,9 @@ class AlpacaHybridBot:
 
     async def run(self):
         logger.info("=" * 60)
-        logger.info("🚀 ALPACA PAPER TRADING MODE - HYBRID STRATEGY")
+        logger.info("🚀 ALPACA CRYPTO PAPER TRADING - HYBRID STRATEGY")
         logger.info(f"🎯 Buy Threshold: {self.buy_threshold} | Sell: {self.sell_threshold}")
+        logger.info(f"💰 Position Size: ${self.position_usd} per trade")
         logger.info(f"📊 Symbols: {', '.join(self.symbols)}")
         logger.info("=" * 60)
         
@@ -305,50 +289,47 @@ class AlpacaHybridBot:
                 
                 for symbol in self.symbols:
                     try:
-                        # Get data
-                        price, df = await self.fetch_historical_data(symbol)
+                        # Get crypto data
+                        price, df = await self.fetch_crypto_data(symbol)
                         
                         if price is None or df is None:
+                            logger.warning(f"⚠️ No data for {symbol}, skipping...")
                             continue
                         
                         score = self.ml.predict(df)
                         current_position = self.get_position_qty(symbol)
                         
-                        logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Position: {current_position}")
+                        logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Position: {current_position:.4f}")
                         
                         # ========== BUY SIGNAL ==========
                         if score > self.buy_threshold and current_position == 0:
-                            shares = int(self.position_value / price)
-                            if shares > 0:
-                                logger.info(f"🟢 BUY: {symbol} @ ${price:.2f} - {shares} shares (Score: {score:.3f})")
-                                
-                                write_trade_to_csv(symbol, 'BUY', price, score=score)
-                                
-                                if not self.paper_mode:
-                                    self.submit_order(symbol, shares, 'buy')
-                                
-                                self.positions[symbol] = {
-                                    'price': price,
-                                    'shares': shares,
-                                    'entry_time': datetime.now().isoformat(),
-                                    'entry_score': score
-                                }
-                                self.save_state()
+                            logger.info(f"🟢 BUY SIGNAL: {symbol} @ ${price:.2f} (Score: {score:.3f})")
+                            
+                            write_trade_to_csv(symbol, 'BUY', price, score=score)
+                            
+                            if not self.paper_mode and self.api_key:
+                                self.submit_crypto_order(symbol, self.position_usd, 'buy')
+                            
+                            self.positions[symbol] = {
+                                'price': price,
+                                'entry_time': datetime.now().isoformat(),
+                                'entry_score': score
+                            }
+                            self.save_state()
                         
                         # ========== SELL SIGNAL ==========
                         elif score < self.sell_threshold and current_position > 0:
                             entry_price = self.positions[symbol]['price'] if symbol in self.positions else price
-                            shares = self.positions[symbol].get('shares', current_position) if symbol in self.positions else current_position
                             pnl_pct = ((price - entry_price) / entry_price) * 100
-                            pnl_usd = (price - entry_price) / entry_price * (shares * entry_price)
+                            pnl_usd = (price - entry_price) / entry_price * self.position_usd
                             self.total_pnl += pnl_usd
                             
-                            logger.info(f"🔴 SELL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usd:.2f}) | Total: ${self.total_pnl:.2f}")
+                            logger.info(f"🔴 SELL SIGNAL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usd:.2f}) | Total: ${self.total_pnl:.2f}")
                             
                             write_trade_to_csv(symbol, 'SELL', price, pnl_usd, self.total_pnl, score)
                             
-                            if not self.paper_mode:
-                                self.submit_order(symbol, shares, 'sell')
+                            if not self.paper_mode and self.api_key:
+                                self.submit_crypto_order(symbol, self.position_usd, 'sell')
                             
                             if symbol in self.positions:
                                 del self.positions[symbol]
@@ -376,7 +357,7 @@ class AlpacaHybridBot:
 
 if __name__ == "__main__":
     paper_mode = os.getenv('PAPER_MODE', 'true').lower() == 'true'
-    bot = AlpacaHybridBot(paper_mode=paper_mode, interval_minutes=5)
+    bot = AlpacaCryptoBot(paper_mode=paper_mode, interval_minutes=5)
     
     try:
         asyncio.run(bot.run())
