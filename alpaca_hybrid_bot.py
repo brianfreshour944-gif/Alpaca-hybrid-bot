@@ -19,7 +19,11 @@ from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s'
+)
+
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
@@ -31,12 +35,30 @@ def init_csv():
     if not os.path.exists('trades.csv'):
         with open('trades.csv', 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Timestamp', 'Symbol', 'Side', 'Price', 'PnL_USD', 'Total_PnL_USD', 'Score'])
+            writer.writerow([
+                'Timestamp',
+                'Symbol',
+                'Side',
+                'Price',
+                'PnL_USD',
+                'Total_PnL_USD',
+                'Score'
+            ])
 
-def write_trade_to_csv(symbol, side, price, pnl_usd=None, total_pnl=None, score=None):
+
+def write_trade_to_csv(
+    symbol,
+    side,
+    price,
+    pnl_usd=None,
+    total_pnl=None,
+    score=None
+):
     """Write a trade to CSV file"""
+
     with open('trades.csv', 'a', newline='') as f:
         writer = csv.writer(f)
+
         writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             symbol,
@@ -47,37 +69,57 @@ def write_trade_to_csv(symbol, side, price, pnl_usd=None, total_pnl=None, score=
             score if score is not None else ''
         ])
 
+
 # ==============================================================================
 # HYBRID PREDICTOR
 # ==============================================================================
 
 class HybridPredictor:
+
     def __init__(self):
         self.score_history = []
-        
+
     def predict(self, df):
+
         if df is None or len(df) < 50:
             return 0.5
-        
+
         close = df['close'].values
         volume = df['volume'].values
-        
+
         ma20 = np.mean(close[-20:])
         std20 = np.std(close[-20:])
-        z_score = (close[-1] - ma20) / std20 if std20 > 0 else 0
-        
+
+        z_score = (
+            (close[-1] - ma20) / std20
+            if std20 > 0 else 0
+        )
+
         rsi = self._calculate_rsi(close)
-        
+
         ema9 = self._calculate_ema(close, 9)
         ema21 = self._calculate_ema(close, 21)
-        is_uptrend = ema9[-1] > ema21[-1] and close[-1] > ema9[-1]
-        is_downtrend = ema9[-1] < ema21[-1] and close[-1] < ema9[-1]
-        
+
+        is_uptrend = (
+            ema9[-1] > ema21[-1]
+            and close[-1] > ema9[-1]
+        )
+
+        is_downtrend = (
+            ema9[-1] < ema21[-1]
+            and close[-1] < ema9[-1]
+        )
+
         vol_avg = np.mean(volume[-10:])
-        vol_surge = volume[-1] / vol_avg if vol_avg > 0 else 1
-        
+
+        vol_surge = (
+            volume[-1] / vol_avg
+            if vol_avg > 0 else 1
+        )
+
         score = 0.5
-        
+
+        # Mean reversion logic
         if z_score < -1.2:
             score += 0.35
         elif z_score < -0.8:
@@ -90,7 +132,8 @@ class HybridPredictor:
             score -= 0.25
         elif z_score > 0.4:
             score -= 0.15
-        
+
+        # RSI filter
         if rsi < 35:
             score += 0.10
         elif rsi < 45:
@@ -99,303 +142,680 @@ class HybridPredictor:
             score -= 0.10
         elif rsi > 55:
             score -= 0.05
-        
+
+        # Trend filter
         if is_uptrend and score > 0.5:
             score += 0.08
+
         elif is_downtrend and score < 0.5:
             score -= 0.08
-        
+
+        # Volume filter
         if vol_surge > 1.3:
+
             if score > 0.5:
                 score += 0.05
             else:
                 score -= 0.05
-        
+
         score = max(0.0, min(1.0, score))
-        
+
         self.score_history.append(score)
+
         if len(self.score_history) > 5:
             self.score_history.pop(0)
-        
-        return np.mean(self.score_history) if self.score_history else score
-    
+
+        return (
+            np.mean(self.score_history)
+            if self.score_history else score
+        )
+
     def _calculate_rsi(self, prices, period=14):
+
         if len(prices) < period + 1:
             return 50
-        deltas = np.diff(prices[-period-1:])
-        gain = np.mean(deltas[deltas > 0]) if any(deltas > 0) else 0.001
-        loss = -np.mean(deltas[deltas < 0]) if any(deltas < 0) else 0.001
+
+        deltas = np.diff(prices[-period - 1:])
+
+        gain = (
+            np.mean(deltas[deltas > 0])
+            if any(deltas > 0) else 0.001
+        )
+
+        loss = (
+            -np.mean(deltas[deltas < 0])
+            if any(deltas < 0) else 0.001
+        )
+
         rs = gain / loss
+
         return 100 - (100 / (1 + rs))
-    
+
     def _calculate_ema(self, prices, period):
+
         alpha = 2 / (period + 1)
+
         ema = np.zeros_like(prices)
+
         ema[0] = prices[0]
+
         for i in range(1, len(prices)):
-            ema[i] = prices[i] * alpha + ema[i-1] * (1 - alpha)
+
+            ema[i] = (
+                prices[i] * alpha
+                + ema[i - 1] * (1 - alpha)
+            )
+
         return ema
 
+
 # ==============================================================================
-# MAIN ALPACA CRYPTO BOT CLASS - FIXED
+# MAIN BOT CLASS
 # ==============================================================================
 
 class AlpacaCryptoBot:
-    def __init__(self, paper_mode: bool = True, interval_minutes: int = 5):
+
+    def __init__(
+        self,
+        paper_mode: bool = True,
+        interval_minutes: int = 5
+    ):
+
         self.paper_mode = paper_mode
         self.interval_minutes = interval_minutes
-        
+
+        # STRATEGY SETTINGS
         self.buy_threshold = 0.51
         self.sell_threshold = 0.49
-        self.position_usd = 25  # $25 per crypto trade
-        
-        # Alpaca API keys from environment
+        self.position_usd = 25
+
+        # API KEYS
         self.api_key = os.getenv("APCA_API_KEY_ID", "")
         self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
-        
+
         if not self.api_key or not self.secret_key:
-            logger.warning("⚠️ Alpaca API keys not set. Bot will run in analysis-only mode.")
-        
-        # Initialize Alpaca clients
+            logger.warning(
+                "⚠️ Alpaca API keys not set. "
+                "Bot will run in analysis-only mode."
+            )
+
+        # CLIENTS
         self.trading_client = None
-        self.data_client = CryptoHistoricalDataClient()  # No API keys needed for historical data
-        
+
+        self.data_client = CryptoHistoricalDataClient()
+
         if self.api_key and self.secret_key:
-            self.trading_client = TradingClient(self.api_key, self.secret_key, paper=paper_mode)
+
+            self.trading_client = TradingClient(
+                self.api_key,
+                self.secret_key,
+                paper=paper_mode
+            )
+
             logger.info("✅ Alpaca trading client initialized")
-        
-        # Crypto symbols - Use USD pairs
-        self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'LTC/USD']
-        
+
+            # CONNECTION TEST
+            try:
+
+                account = self.trading_client.get_account()
+
+                logger.info(
+                    f"✅ Connected to Alpaca Account: {account.id}"
+                )
+
+                logger.info(
+                    f"💵 Buying Power: ${account.buying_power}"
+                )
+
+            except Exception as e:
+
+                logger.error(
+                    f"❌ Alpaca connection failed: {e}"
+                )
+
+        # SYMBOLS
+        self.symbols = [
+            'BTC/USD',
+            'ETH/USD',
+            'SOL/USD',
+            'LTC/USD'
+        ]
+
         self.ml = HybridPredictor()
+
         self.positions = {}
         self.trades = []
+
         self.running = True
+
         self.total_pnl = 0.0
-        
-        # Initialize CSV
+
+        # CSV
         init_csv()
+
         logger.info("📊 CSV logging initialized: trades.csv")
-        
+
         self.load_state()
 
+    # ==========================================================================
+    # STATE MANAGEMENT
+    # ==========================================================================
+
     def load_state(self):
+
         if os.path.exists("alpaca_crypto_state.json"):
+
             try:
+
                 with open("alpaca_crypto_state.json", "r") as f:
+
                     data = json.load(f)
-                    self.positions = data.get("positions", {})
-                    self.trades = data.get("trades", [])
-                    self.total_pnl = data.get("total_pnl", 0.0)
-                    logger.info(f"📂 Loaded state: {len(self.positions)} positions")
+
+                    self.positions = data.get(
+                        "positions",
+                        {}
+                    )
+
+                    self.trades = data.get(
+                        "trades",
+                        []
+                    )
+
+                    self.total_pnl = data.get(
+                        "total_pnl",
+                        0.0
+                    )
+
+                    logger.info(
+                        f"📂 Loaded state: "
+                        f"{len(self.positions)} positions"
+                    )
+
             except Exception as e:
-                logger.warning(f"Load state failed: {e}")
+
+                logger.warning(
+                    f"Load state failed: {e}"
+                )
 
     def save_state(self):
+
         try:
-            with open("alpaca_crypto_state.json", "w") as f:
+
+            with open(
+                "alpaca_crypto_state.json",
+                "w"
+            ) as f:
+
                 json.dump({
+
                     "positions": self.positions,
+
                     "trades": self.trades[-100:],
+
                     "total_pnl": self.total_pnl
+
                 }, f)
+
         except Exception as e:
-            logger.warning(f"Save state failed: {e}")
+
+            logger.warning(
+                f"Save state failed: {e}"
+            )
+
+    # ==========================================================================
+    # POSITION MANAGEMENT
+    # ==========================================================================
 
     def get_position_qty(self, symbol):
-        """Get current position quantity from Alpaca"""
+
         try:
+
             if self.trading_client:
-                alpaca_symbol = symbol.replace('/', '')
+
                 positions = self.trading_client.get_all_positions()
+
                 for pos in positions:
-                    if pos.symbol == alpaca_symbol:
+
+                    if pos.symbol == symbol:
+
                         return float(pos.qty)
+
         except Exception as e:
-            logger.debug(f"Position check failed: {e}")
+
+            logger.debug(
+                f"Position check failed: {e}"
+            )
+
         return 0
 
-    def submit_crypto_order(self, symbol, usd_amount, side):
-        """Submit a crypto order - FIXED VERSION"""
+    # ==========================================================================
+    # ORDER EXECUTION
+    # ==========================================================================
+
+    def submit_crypto_order(
+        self,
+        symbol,
+        usd_amount,
+        side
+    ):
+
         try:
+
             if not self.trading_client:
+
+                logger.error(
+                    "Trading client not initialized"
+                )
+
                 return False
-            
-            # Format symbol for Alpaca (remove slash)
-            alpaca_symbol = symbol.replace('/', '')
-            
-            # Get current price to calculate quantity
+
+            # Get current price
             price = self.get_current_price(symbol)
+
             if not price:
-                logger.error(f"Cannot get price for {symbol}")
+
+                logger.error(
+                    f"Cannot get price for {symbol}"
+                )
+
                 return False
-            
-            # Calculate quantity based on USD amount
+
+            # Calculate quantity
             qty = round(usd_amount / price, 6)
-            
-            # Ensure minimum order value ($10)
-            if qty * price < 10:
-                logger.warning(f"Order too small: ${qty * price:.2f} (minimum $10)")
-                return False
-            
-            # CRITICAL FIX: Use qty (not notional) and GTC (not DAY)
-            order_data = MarketOrderRequest(
-                symbol=alpaca_symbol,
-                qty=qty,  # FIXED: Use qty instead of notional
-                side=OrderSide.BUY if side == 'buy' else OrderSide.SELL,
-                time_in_force=TimeInForce.GTC  # FIXED: Use GTC for crypto
+
+            logger.info(
+                f"📤 Submitting order: "
+                f"{side.upper()} {qty} {symbol} "
+                f"@ ${price:.2f}"
             )
-            
-            order = self.trading_client.submit_order(order_data)
-            logger.info(f"✅ ORDER EXECUTED: {side.upper()} {qty} {symbol} (${usd_amount}) | ID: {order.id}")
+
+            # Minimum order size
+            order_value = qty * price
+
+            if order_value < 10:
+
+                logger.warning(
+                    f"Order too small: "
+                    f"${order_value:.2f}"
+                )
+
+                return False
+
+            # MARKET ORDER
+            order_data = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=(
+                    OrderSide.BUY
+                    if side == 'buy'
+                    else OrderSide.SELL
+                ),
+                time_in_force=TimeInForce.GTC
+            )
+
+            # SUBMIT ORDER
+            order = self.trading_client.submit_order(
+                order_data
+            )
+
+            logger.info(
+                f"✅ ORDER EXECUTED | "
+                f"{side.upper()} {qty} {symbol} | "
+                f"Order ID: {order.id}"
+            )
+
             return True
-            
+
         except Exception as e:
-            logger.error(f"❌ Order failed for {symbol}: {e}")
+
+            logger.error(
+                f"❌ Order failed for {symbol}: {e}"
+            )
+
             return False
 
+    # ==========================================================================
+    # MARKET DATA
+    # ==========================================================================
+
     def get_current_price(self, symbol):
-        """Get current price for a symbol"""
+
         try:
-            # Try to get from Alpaca data client
-            if self.data_client:
-                request = CryptoBarsRequest(
-                    symbol_or_symbols=symbol,
-                    timeframe=TimeFrame.Minute,
-                    limit=1
-                )
-                bars = self.data_client.get_crypto_bars(request)
-                if bars and bars.data and symbol in bars.data:
-                    return bars.data[symbol][-1].close
+
+            request = CryptoBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                limit=1
+            )
+
+            bars = self.data_client.get_crypto_bars(
+                request
+            )
+
+            if (
+                bars
+                and bars.data
+                and symbol in bars.data
+            ):
+
+                return bars.data[symbol][-1].close
+
         except Exception as e:
-            logger.debug(f"Price fetch failed: {e}")
+
+            logger.debug(
+                f"Price fetch failed: {e}"
+            )
+
         return None
 
     async def fetch_crypto_data(self, symbol):
-        """Fetch historical crypto data from Alpaca"""
+
         try:
-            if not self.data_client:
-                return None, None
-            
+
             request = CryptoBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Minute,
                 start=datetime.now() - timedelta(days=1),
                 limit=100
             )
-            bars = self.data_client.get_crypto_bars(request)
-            
-            if not bars or not bars.data or symbol not in bars.data:
+
+            bars = self.data_client.get_crypto_bars(
+                request
+            )
+
+            if (
+                not bars
+                or not bars.data
+                or symbol not in bars.data
+            ):
+
                 return None, None
-            
+
             bars_list = bars.data[symbol]
-            
+
             df = pd.DataFrame({
-                'close': [bar.close for bar in bars_list],
-                'volume': [bar.volume for bar in bars_list]
+
+                'close': [
+                    bar.close for bar in bars_list
+                ],
+
+                'volume': [
+                    bar.volume for bar in bars_list
+                ]
             })
-            
+
             current_price = bars_list[-1].close
-            
+
             return current_price, df
-            
+
         except Exception as e:
-            logger.error(f"Error fetching {symbol}: {e}")
+
+            logger.error(
+                f"Error fetching {symbol}: {e}"
+            )
+
             return None, None
 
+    # ==========================================================================
+    # MAIN LOOP
+    # ==========================================================================
+
     async def run(self):
+
         logger.info("=" * 60)
-        logger.info("🚀 ALPACA CRYPTO PAPER TRADING - HYBRID STRATEGY")
-        logger.info(f"🎯 Buy Threshold: {self.buy_threshold} | Sell: {self.sell_threshold}")
-        logger.info(f"💰 Position Size: ${self.position_usd} per trade")
-        logger.info(f"📊 Symbols: {', '.join(self.symbols)}")
+
+        logger.info(
+            "🚀 ALPACA CRYPTO HYBRID STRATEGY"
+        )
+
+        logger.info(
+            f"🎯 Buy Threshold: {self.buy_threshold} | "
+            f"Sell Threshold: {self.sell_threshold}"
+        )
+
+        logger.info(
+            f"💰 Position Size: "
+            f"${self.position_usd} per trade"
+        )
+
+        logger.info(
+            f"📊 Symbols: {', '.join(self.symbols)}"
+        )
+
         logger.info("=" * 60)
-        
+
         last_cycle = 0
-        interval_seconds = self.interval_minutes * 60
-        
+
+        interval_seconds = (
+            self.interval_minutes * 60
+        )
+
         while self.running:
+
             try:
+
                 now = time.time()
+
                 if now - last_cycle >= interval_seconds:
+
                     last_cycle = now
-                    
+
                     for symbol in self.symbols:
+
                         try:
-                            # Get crypto data
-                            price, df = await self.fetch_crypto_data(symbol)
-                            
-                            if price is None or df is None:
-                                logger.warning(f"⚠️ No data for {symbol}, skipping...")
+
+                            # FETCH DATA
+                            price, df = await self.fetch_crypto_data(
+                                symbol
+                            )
+
+                            if (
+                                price is None
+                                or df is None
+                            ):
+
+                                logger.warning(
+                                    f"⚠️ No data for "
+                                    f"{symbol}, skipping..."
+                                )
+
                                 continue
-                            
+
+                            # ML SCORE
                             score = self.ml.predict(df)
-                            current_position = self.get_position_qty(symbol)
-                            
-                            logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Position: {current_position:.8f}")
-                            
-                            # ========== SELL SIGNAL (Check first) ==========
-                            if score < self.sell_threshold and current_position > 0:
-                                logger.info(f"🔴 SELL SIGNAL: {symbol} @ ${price:.2f} (Score: {score:.3f})")
-                                
-                                entry_price = self.positions[symbol]['price'] if symbol in self.positions else price
-                                pnl_pct = ((price - entry_price) / entry_price) * 100
-                                pnl_usd = (price - entry_price) / entry_price * self.position_usd
+
+                            # CURRENT POSITION
+                            current_position = (
+                                self.get_position_qty(symbol)
+                            )
+
+                            logger.info(
+                                f"📊 {symbol} | "
+                                f"${price:.2f} | "
+                                f"Score: {score:.3f} | "
+                                f"Position: "
+                                f"{current_position:.8f}"
+                            )
+
+                            # ==================================================
+                            # SELL SIGNAL
+                            # ==================================================
+
+                            if (
+                                score < self.sell_threshold
+                                and current_position > 0
+                            ):
+
+                                logger.info(
+                                    f"🔴 SELL SIGNAL: "
+                                    f"{symbol} @ ${price:.2f} "
+                                    f"(Score: {score:.3f})"
+                                )
+
+                                entry_price = (
+                                    self.positions[symbol]['price']
+                                    if symbol in self.positions
+                                    else price
+                                )
+
+                                pnl_pct = (
+                                    (
+                                        price - entry_price
+                                    ) / entry_price
+                                ) * 100
+
+                                pnl_usd = (
+                                    (
+                                        price - entry_price
+                                    ) / entry_price
+                                ) * self.position_usd
+
                                 self.total_pnl += pnl_usd
-                                
-                                logger.info(f"   PnL: {pnl_pct:.2f}% (${pnl_usd:.2f}) | Total: ${self.total_pnl:.2f}")
-                                
-                                write_trade_to_csv(symbol, 'SELL', price, pnl_usd, self.total_pnl, score)
-                                
-                                if not self.paper_mode and self.trading_client:
-                                    self.submit_crypto_order(symbol, self.position_usd, 'sell')
-                                
-                                if symbol in self.positions:
-                                    del self.positions[symbol]
-                                self.save_state()
-                            
-                            # ========== BUY SIGNAL ==========
-                            elif score > self.buy_threshold and current_position == 0:
-                                logger.info(f"🟢 BUY SIGNAL: {symbol} @ ${price:.2f} (Score: {score:.3f})")
-                                
-                                write_trade_to_csv(symbol, 'BUY', price, score=score)
-                                
-                                if not self.paper_mode and self.trading_client:
-                                    self.submit_crypto_order(symbol, self.position_usd, 'buy')
-                                
-                                self.positions[symbol] = {
-                                    'price': price,
-                                    'entry_time': datetime.now().isoformat(),
-                                    'entry_score': score
-                                }
-                                self.save_state()
-                        
+
+                                logger.info(
+                                    f"   PnL: "
+                                    f"{pnl_pct:.2f}% "
+                                    f"(${pnl_usd:.2f}) | "
+                                    f"Total: "
+                                    f"${self.total_pnl:.2f}"
+                                )
+
+                                write_trade_to_csv(
+                                    symbol,
+                                    'SELL',
+                                    price,
+                                    pnl_usd,
+                                    self.total_pnl,
+                                    score
+                                )
+
+                                # EXECUTE SELL
+                                if self.trading_client:
+
+                                    success = (
+                                        self.submit_crypto_order(
+                                            symbol,
+                                            self.position_usd,
+                                            'sell'
+                                        )
+                                    )
+
+                                    if success:
+
+                                        if symbol in self.positions:
+                                            del self.positions[symbol]
+
+                                        self.save_state()
+
+                            # ==================================================
+                            # BUY SIGNAL
+                            # ==================================================
+
+                            elif (
+                                score > self.buy_threshold
+                                and current_position == 0
+                            ):
+
+                                logger.info(
+                                    f"🟢 BUY SIGNAL: "
+                                    f"{symbol} @ ${price:.2f} "
+                                    f"(Score: {score:.3f})"
+                                )
+
+                                write_trade_to_csv(
+                                    symbol,
+                                    'BUY',
+                                    price,
+                                    score=score
+                                )
+
+                                # EXECUTE BUY
+                                if self.trading_client:
+
+                                    success = (
+                                        self.submit_crypto_order(
+                                            symbol,
+                                            self.position_usd,
+                                            'buy'
+                                        )
+                                    )
+
+                                    if success:
+
+                                        self.positions[symbol] = {
+
+                                            'price': price,
+
+                                            'entry_time': (
+                                                datetime.now().isoformat()
+                                            ),
+
+                                            'entry_score': score
+                                        }
+
+                                        self.save_state()
+
                         except Exception as e:
-                            logger.error(f"Error processing {symbol}: {e}")
-                
+
+                            logger.error(
+                                f"Error processing "
+                                f"{symbol}: {e}"
+                            )
+
                 await asyncio.sleep(1)
-                
+
             except Exception as e:
-                logger.error(f"Main loop error: {e}")
+
+                logger.error(
+                    f"Main loop error: {e}"
+                )
+
                 await asyncio.sleep(5)
-        
+
+    # ==========================================================================
+    # STOP BOT
+    # ==========================================================================
+
     def stop(self):
+
         self.running = False
+
         self.save_state()
+
         logger.info("=" * 60)
-        logger.info(f"🛑 Bot stopped | Total PnL: ${self.total_pnl:.2f}")
+
+        logger.info(
+            f"🛑 Bot stopped | "
+            f"Total PnL: ${self.total_pnl:.2f}"
+        )
+
         logger.info("=" * 60)
+
 
 # ==============================================================================
 # ENTRY POINT
 # ==============================================================================
 
 if __name__ == "__main__":
-    paper_mode = os.getenv('PAPER_MODE', 'true').lower() == 'true'
-    bot = AlpacaCryptoBot(paper_mode=paper_mode, interval_minutes=5)
-    
+
+    paper_mode = (
+        os.getenv(
+            'PAPER_MODE',
+            'true'
+        ).lower() == 'true'
+    )
+
+    bot = AlpacaCryptoBot(
+        paper_mode=paper_mode,
+        interval_minutes=5
+    )
+
     try:
+
         asyncio.run(bot.run())
+
     except KeyboardInterrupt:
+
         bot.stop()
+
         logger.info("Shutdown complete")
