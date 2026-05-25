@@ -1,4 +1,5 @@
-# Alpaca Crypto Hybrid Trading Bot
+
+# Alpaca Crypto Hybrid Trading Bot - FIXED VERSION
 
 import asyncio
 import pandas as pd
@@ -136,7 +137,7 @@ class HybridPredictor:
         return ema
 
 # ==============================================================================
-# MAIN ALPACA CRYPTO BOT CLASS
+# MAIN ALPACA CRYPTO BOT CLASS - FIXED
 # ==============================================================================
 
 class AlpacaCryptoBot:
@@ -157,13 +158,13 @@ class AlpacaCryptoBot:
         
         # Initialize Alpaca clients
         self.trading_client = None
-        self.data_client = None
+        self.data_client = CryptoHistoricalDataClient()  # No API keys needed for historical data
         
         if self.api_key and self.secret_key:
             self.trading_client = TradingClient(self.api_key, self.secret_key, paper=paper_mode)
-            self.data_client = CryptoHistoricalDataClient(self.api_key, self.secret_key)
+            logger.info("✅ Alpaca trading client initialized")
         
-        # Crypto symbols - Use USD pairs (Alpaca's official format)
+        # Crypto symbols - Use USD pairs
         self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'LTC/USD']
         
         self.ml = HybridPredictor()
@@ -186,6 +187,7 @@ class AlpacaCryptoBot:
                     self.positions = data.get("positions", {})
                     self.trades = data.get("trades", [])
                     self.total_pnl = data.get("total_pnl", 0.0)
+                    logger.info(f"📂 Loaded state: {len(self.positions)} positions")
             except Exception as e:
                 logger.warning(f"Load state failed: {e}")
 
@@ -201,40 +203,73 @@ class AlpacaCryptoBot:
             logger.warning(f"Save state failed: {e}")
 
     def get_position_qty(self, symbol):
-        """Get current position quantity for crypto"""
+        """Get current position quantity from Alpaca"""
         try:
             if self.trading_client:
-                # Format: Remove slash for position lookup (BTCUSD not BTC/USD)
                 alpaca_symbol = symbol.replace('/', '')
                 positions = self.trading_client.get_all_positions()
                 for pos in positions:
                     if pos.symbol == alpaca_symbol:
                         return float(pos.qty)
         except Exception as e:
-            logger.debug(f"Position check failed for {symbol}: {e}")
+            logger.debug(f"Position check failed: {e}")
         return 0
 
     def submit_crypto_order(self, symbol, usd_amount, side):
-        """Submit a crypto order using USD amount"""
+        """Submit a crypto order - FIXED VERSION"""
         try:
             if not self.trading_client:
                 return False
             
-            # Format symbol for Alpaca (remove slash for order API)
+            # Format symbol for Alpaca (remove slash)
             alpaca_symbol = symbol.replace('/', '')
             
+            # Get current price to calculate quantity
+            price = self.get_current_price(symbol)
+            if not price:
+                logger.error(f"Cannot get price for {symbol}")
+                return False
+            
+            # Calculate quantity based on USD amount
+            qty = round(usd_amount / price, 6)
+            
+            # Ensure minimum order value ($10)
+            if qty * price < 10:
+                logger.warning(f"Order too small: ${qty * price:.2f} (minimum $10)")
+                return False
+            
+            # CRITICAL FIX: Use qty (not notional) and GTC (not DAY)
             order_data = MarketOrderRequest(
                 symbol=alpaca_symbol,
-                notional=usd_amount,
+                qty=qty,  # FIXED: Use qty instead of notional
                 side=OrderSide.BUY if side == 'buy' else OrderSide.SELL,
-                time_in_force=TimeInForce.DAY
+                time_in_force=TimeInForce.GTC  # FIXED: Use GTC for crypto
             )
+            
             order = self.trading_client.submit_order(order_data)
-            logger.info(f"✅ Order placed: {side.upper()} ${usd_amount} of {symbol}")
+            logger.info(f"✅ ORDER EXECUTED: {side.upper()} {qty} {symbol} (${usd_amount}) | ID: {order.id}")
             return True
+            
         except Exception as e:
-            logger.error(f"Order failed: {e}")
+            logger.error(f"❌ Order failed for {symbol}: {e}")
             return False
+
+    def get_current_price(self, symbol):
+        """Get current price for a symbol"""
+        try:
+            # Try to get from Alpaca data client
+            if self.data_client:
+                request = CryptoBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=TimeFrame.Minute,
+                    limit=1
+                )
+                bars = self.data_client.get_crypto_bars(request)
+                if bars and bars.data and symbol in bars.data:
+                    return bars.data[symbol][-1].close
+        except Exception as e:
+            logger.debug(f"Price fetch failed: {e}")
+        return None
 
     async def fetch_crypto_data(self, symbol):
         """Fetch historical crypto data from Alpaca"""
@@ -242,7 +277,6 @@ class AlpacaCryptoBot:
             if not self.data_client:
                 return None, None
             
-            # For historical data, keep the slash format
             request = CryptoBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Minute,
@@ -251,7 +285,7 @@ class AlpacaCryptoBot:
             )
             bars = self.data_client.get_crypto_bars(request)
             
-            if not bars.data or symbol not in bars.data:
+            if not bars or not bars.data or symbol not in bars.data:
                 return None, None
             
             bars_list = bars.data[symbol]
@@ -277,64 +311,67 @@ class AlpacaCryptoBot:
         logger.info(f"📊 Symbols: {', '.join(self.symbols)}")
         logger.info("=" * 60)
         
+        last_cycle = 0
+        interval_seconds = self.interval_minutes * 60
+        
         while self.running:
             try:
-                # Wait for next interval
                 now = time.time()
-                interval_seconds = self.interval_minutes * 60
-                time_to_sleep = interval_seconds - (now % interval_seconds)
-                await asyncio.sleep(max(1, time_to_sleep))
-                
-                for symbol in self.symbols:
-                    try:
-                        # Get crypto data
-                        price, df = await self.fetch_crypto_data(symbol)
-                        
-                        if price is None or df is None:
-                            logger.warning(f"⚠️ No data for {symbol}, skipping...")
-                            continue
-                        
-                        score = self.ml.predict(df)
-                        current_position = self.get_position_qty(symbol)
-                        
-                        logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Position: {current_position:.8f}")
-                        
-                        # ========== BUY SIGNAL ==========
-                        if score > self.buy_threshold and current_position == 0:
-                            logger.info(f"🟢 BUY SIGNAL: {symbol} @ ${price:.2f} (Score: {score:.3f})")
-                            
-                            write_trade_to_csv(symbol, 'BUY', price, score=score)
-                            
-                            if not self.paper_mode and self.api_key:
-                                self.submit_crypto_order(symbol, self.position_usd, 'buy')
-                            
-                            self.positions[symbol] = {
-                                'price': price,
-                                'entry_time': datetime.now().isoformat(),
-                                'entry_score': score
-                            }
-                            self.save_state()
-                        
-                        # ========== SELL SIGNAL ==========
-                        elif score < self.sell_threshold and current_position > 0:
-                            entry_price = self.positions[symbol]['price'] if symbol in self.positions else price
-                            pnl_pct = ((price - entry_price) / entry_price) * 100
-                            pnl_usd = (price - entry_price) / entry_price * self.position_usd
-                            self.total_pnl += pnl_usd
-                            
-                            logger.info(f"🔴 SELL SIGNAL: {symbol} @ ${price:.2f} | PnL: {pnl_pct:.2f}% (${pnl_usd:.2f}) | Total: ${self.total_pnl:.2f}")
-                            
-                            write_trade_to_csv(symbol, 'SELL', price, pnl_usd, self.total_pnl, score)
-                            
-                            if not self.paper_mode and self.api_key:
-                                self.submit_crypto_order(symbol, self.position_usd, 'sell')
-                            
-                            if symbol in self.positions:
-                                del self.positions[symbol]
-                            self.save_state()
+                if now - last_cycle >= interval_seconds:
+                    last_cycle = now
                     
-                    except Exception as e:
-                        logger.error(f"Error processing {symbol}: {e}")
+                    for symbol in self.symbols:
+                        try:
+                            # Get crypto data
+                            price, df = await self.fetch_crypto_data(symbol)
+                            
+                            if price is None or df is None:
+                                logger.warning(f"⚠️ No data for {symbol}, skipping...")
+                                continue
+                            
+                            score = self.ml.predict(df)
+                            current_position = self.get_position_qty(symbol)
+                            
+                            logger.info(f"📊 {symbol} | ${price:.2f} | Score: {score:.3f} | Position: {current_position:.8f}")
+                            
+                            # ========== SELL SIGNAL (Check first) ==========
+                            if score < self.sell_threshold and current_position > 0:
+                                logger.info(f"🔴 SELL SIGNAL: {symbol} @ ${price:.2f} (Score: {score:.3f})")
+                                
+                                entry_price = self.positions[symbol]['price'] if symbol in self.positions else price
+                                pnl_pct = ((price - entry_price) / entry_price) * 100
+                                pnl_usd = (price - entry_price) / entry_price * self.position_usd
+                                self.total_pnl += pnl_usd
+                                
+                                logger.info(f"   PnL: {pnl_pct:.2f}% (${pnl_usd:.2f}) | Total: ${self.total_pnl:.2f}")
+                                
+                                write_trade_to_csv(symbol, 'SELL', price, pnl_usd, self.total_pnl, score)
+                                
+                                if not self.paper_mode and self.trading_client:
+                                    self.submit_crypto_order(symbol, self.position_usd, 'sell')
+                                
+                                if symbol in self.positions:
+                                    del self.positions[symbol]
+                                self.save_state()
+                            
+                            # ========== BUY SIGNAL ==========
+                            elif score > self.buy_threshold and current_position == 0:
+                                logger.info(f"🟢 BUY SIGNAL: {symbol} @ ${price:.2f} (Score: {score:.3f})")
+                                
+                                write_trade_to_csv(symbol, 'BUY', price, score=score)
+                                
+                                if not self.paper_mode and self.trading_client:
+                                    self.submit_crypto_order(symbol, self.position_usd, 'buy')
+                                
+                                self.positions[symbol] = {
+                                    'price': price,
+                                    'entry_time': datetime.now().isoformat(),
+                                    'entry_score': score
+                                }
+                                self.save_state()
+                        
+                        except Exception as e:
+                            logger.error(f"Error processing {symbol}: {e}")
                 
                 await asyncio.sleep(1)
                 
