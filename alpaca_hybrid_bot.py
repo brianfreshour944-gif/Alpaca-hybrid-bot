@@ -231,7 +231,8 @@ class AlpacaCryptoBot:
             if self.trading_client:
                 positions = self.trading_client.get_all_positions()
                 for pos in positions:
-                    if pos.symbol == symbol:
+                    # Strip slashes from both strings to normalize 'ETH/USD' and 'ETHUSD'
+                    if pos.symbol.replace("/", "") == symbol.replace("/", ""):
                         return float(pos.qty)
         except Exception as e:
             logger.debug(f"Position check failed: {e}")
@@ -347,7 +348,7 @@ class AlpacaCryptoBot:
     # ==========================================================================
     async def run(self):
         logger.info("=" * 60)
-        logger.info("🚀 ALPACA CRYPTO HYBRID STRATEGY (with duplicate-buy protection)")
+        logger.info("🚀 ALPACA CRYPTO HYBRID STRATEGY (with duplicate-buy prevention)")
         logger.info(f"🎯 Buy: {self.buy_threshold} | Sell: {self.sell_threshold}")
         logger.info(f"💰 Position Size: ${self.position_usd} per trade")
         logger.info(f"📊 Symbols: {', '.join(self.symbols)}")
