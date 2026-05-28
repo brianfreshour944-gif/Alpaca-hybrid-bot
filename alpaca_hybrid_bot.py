@@ -395,27 +395,30 @@ class AlpacaCryptoBot:
     async def submit_order(self, symbol, side, usd_amount=None):
 
         try:
-
             price, _ = await self.fetch_crypto_data(symbol)
 
             if not price:
                 return False, 0, 0
 
             if side == "buy":
-
-                qty = round(usd_amount / price, 6)
-
+                # Down-rounding buffer prevents standard round() from buying slightly over budget
+                qty = round((usd_amount / price) - 0.0000005, 6)
             else:
-
                 positions = await self.get_positions_cache()
-
                 norm = self.normalize_symbol(symbol)
 
                 if norm not in positions:
                     logger.error(f"No position to sell: {symbol}")
                     return False, 0, 0
 
-                qty = round(positions[norm]["qty"], 6)
+                # CRITICAL PRECISION FIX: Force downward truncation down to 6 decimals.
+                # Subtracting a sub-satoshi fraction forces standard round() to floor rather than ceil.
+                raw_qty = positions[norm]["qty"]
+                qty = round(raw_qty - 0.0000005, 6)
+                
+                # Backup safety: if down-rounding zeros it out entirely, preserve raw balance
+                if qty <= 0:
+                    qty = raw_qty
 
             order = MarketOrderRequest(
                 symbol=symbol,
@@ -425,15 +428,12 @@ class AlpacaCryptoBot:
             )
 
             self.trading_client.submit_order(order)
-
-            logger.info(f"{side.upper()} {qty} {symbol}")
+            logger.info(f"{side.upper()} order successfully sent for {qty} {symbol}")
 
             return True, qty, price
 
         except Exception as e:
-
             logger.error(f"Order failed: {e}")
-
             return False, 0, 0
 
     # ==========================================================================
@@ -589,7 +589,7 @@ class AlpacaCryptoBot:
                                     or sell_signal
                                 ):
 
-                                    success, qty, fill_price = (
+                                    success, fill_qty, fill_price = (
                                         await self.submit_order(
                                             symbol,
                                             "sell"
@@ -613,13 +613,17 @@ class AlpacaCryptoBot:
                                             symbol,
                                             "SELL",
                                             fill_price,
-                                            qty,
+                                            fill_qty,
                                             pnl_usd,
                                             self.total_pnl,
                                             score,
                                             stop_loss_hit,
                                             take_profit_hit
                                         )
+
+                                        # Clear state memory tracking to avoid bloating tracking dictionary
+                                        if symbol in self.positions:
+                                            del self.positions[symbol]
 
                                         self.cooldowns[symbol] = (
                                             datetime.now()
@@ -638,7 +642,7 @@ class AlpacaCryptoBot:
                                     < self.max_daily_trades
                                 ):
 
-                                    success, qty, fill_price = (
+                                    success, fill_qty, fill_price = (
                                         await self.submit_order(
                                             symbol,
                                             "buy",
@@ -650,14 +654,14 @@ class AlpacaCryptoBot:
 
                                         logger.info(
                                             f"BUY {symbol} "
-                                            f"{qty} @ ${fill_price:.2f}"
+                                            f"{fill_qty} @ ${fill_price:.2f}"
                                         )
 
                                         write_trade_to_csv(
                                             symbol,
                                             "BUY",
                                             fill_price,
-                                            qty,
+                                            fill_qty,
                                             score=score
                                         )
 
@@ -718,11 +722,9 @@ if __name__ == "__main__":
     bot = AlpacaCryptoBot()
 
     try:
-
         asyncio.run(bot.run())
 
     except KeyboardInterrupt:
-
         bot.stop()
 
 
