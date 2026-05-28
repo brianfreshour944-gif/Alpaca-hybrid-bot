@@ -192,53 +192,39 @@ class AlpacaCryptoBot:
     def __init__(self):
 
         self.paper_mode = True
-
         self.interval_minutes = 5
 
         # STRATEGY
-
         self.buy_threshold = 0.58
         self.sell_threshold = 0.42
-
         self.position_usd = 15
 
         # RISK
-
         self.stop_loss_pct = -0.05
         self.take_profit_pct = 0.08
-
         self.daily_loss_limit = -30.0
-
         self.max_daily_trades = 20
-
         self.max_unrealized_drawdown = -50.0
-
         self.min_buying_power_reserve = 20
 
         # API
-
         self.api_key = os.getenv("APCA_API_KEY_ID", "")
         self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
 
         self.trading_client = None
-
         self.data_client = CryptoHistoricalDataClient()
 
         if self.api_key and self.secret_key:
-
             self.trading_client = TradingClient(
                 self.api_key,
                 self.secret_key,
                 paper=self.paper_mode
             )
-
-            logger.info("Connected to Alpaca")
-
+            logger.info("Connected to Alpaca Trading API successfully.")
         else:
-            logger.warning("No API keys found")
+            logger.warning("WARNING: No Alpaca API keys detected in environment variables!")
 
         # SYMBOLS
-
         self.symbols = [
             "BTC/USD",
             "ETH/USD",
@@ -247,23 +233,15 @@ class AlpacaCryptoBot:
         ]
 
         self.ml = HybridPredictor()
-
         self.positions = {}
-
         self.cooldowns = {}
-
         self.total_pnl = 0.0
-
         self.daily_pnl = 0.0
-
         self.daily_trade_count = 0
-
         self.current_day = datetime.now().date()
-
         self.running = True
 
         init_csv()
-
         self.load_state()
 
     # ==========================================================================
@@ -271,14 +249,12 @@ class AlpacaCryptoBot:
     # ==========================================================================
 
     def save_state(self):
-
         cooldowns = {
             s: dt.isoformat()
             for s, dt in self.cooldowns.items()
         }
 
         with open("alpaca_crypto_state.json", "w") as f:
-
             json.dump({
                 "positions": self.positions,
                 "cooldowns": cooldowns,
@@ -289,38 +265,28 @@ class AlpacaCryptoBot:
             }, f)
 
     def load_state(self):
-
         if not os.path.exists("alpaca_crypto_state.json"):
+            logger.info("No prior state file found. Starting with fresh state variables.")
             return
 
         try:
-
             with open("alpaca_crypto_state.json", "r") as f:
-
                 data = json.load(f)
 
             self.positions = data.get("positions", {})
-
             self.total_pnl = data.get("total_pnl", 0.0)
-
             self.daily_pnl = data.get("daily_pnl", 0.0)
-
             self.daily_trade_count = data.get("daily_trade_count", 0)
-
-            self.current_day = datetime.fromisoformat(
-                data.get("current_day")
-            ).date()
+            self.current_day = datetime.fromisoformat(data.get("current_day")).date()
 
             raw = data.get("cooldowns", {})
-
             now = datetime.now()
-
             self.cooldowns = {
                 s: datetime.fromisoformat(v)
                 for s, v in raw.items()
                 if datetime.fromisoformat(v) > now
             }
-
+            logger.info(f"State successfully loaded. Daily Trade Count: {self.daily_trade_count}, Saved PnL: ${self.daily_pnl:.2f}")
         except Exception as e:
             logger.error(f"Load state failed: {e}")
 
@@ -329,29 +295,20 @@ class AlpacaCryptoBot:
     # ==========================================================================
 
     async def get_positions_cache(self):
-
         try:
             positions = self.trading_client.get_all_positions()
-
             cache = {}
-
             for p in positions:
-
                 cache[p.symbol.replace("/", "")] = {
                     "qty": float(p.qty),
                     "avg_price": float(p.avg_entry_price)
                 }
-
             return cache
-
         except Exception as e:
-
-            logger.error(f"Position cache error: {e}")
-
+            logger.error(f"Position cache sync error: {e}")
             return {}
 
     def normalize_symbol(self, symbol):
-
         return symbol.replace("/", "").replace("-", "")
 
     # ==========================================================================
@@ -359,33 +316,25 @@ class AlpacaCryptoBot:
     # ==========================================================================
 
     async def fetch_crypto_data(self, symbol):
-
         try:
-
             request = CryptoBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Minute,
                 limit=100
             )
-
             bars = self.data_client.get_crypto_bars(request)
 
             if symbol not in bars.data:
                 return None, None
 
             bars_list = bars.data[symbol]
-
             df = pd.DataFrame({
                 "close": [b.close for b in bars_list],
                 "volume": [b.volume for b in bars_list]
             })
-
             return bars_list[-1].close, df
-
         except Exception as e:
-
-            logger.error(f"{symbol} fetch failed: {e}")
-
+            logger.error(f"{symbol} data fetch failed: {e}")
             return None, None
 
     # ==========================================================================
@@ -393,30 +342,24 @@ class AlpacaCryptoBot:
     # ==========================================================================
 
     async def submit_order(self, symbol, side, usd_amount=None):
-
         try:
             price, _ = await self.fetch_crypto_data(symbol)
-
             if not price:
                 return False, 0, 0
 
             if side == "buy":
-                # Down-rounding buffer prevents standard round() from buying slightly over budget
                 qty = round((usd_amount / price) - 0.0000005, 6)
             else:
                 positions = await self.get_positions_cache()
                 norm = self.normalize_symbol(symbol)
 
                 if norm not in positions:
-                    logger.error(f"No position to sell: {symbol}")
+                    logger.error(f"Aborting Sell. No active position on exchange for: {symbol}")
                     return False, 0, 0
 
-                # CRITICAL PRECISION FIX: Force downward truncation down to 6 decimals.
-                # Subtracting a sub-satoshi fraction forces standard round() to floor rather than ceil.
                 raw_qty = positions[norm]["qty"]
                 qty = round(raw_qty - 0.0000005, 6)
                 
-                # Backup safety: if down-rounding zeros it out entirely, preserve raw balance
                 if qty <= 0:
                     qty = raw_qty
 
@@ -428,12 +371,11 @@ class AlpacaCryptoBot:
             )
 
             self.trading_client.submit_order(order)
-            logger.info(f"{side.upper()} order successfully sent for {qty} {symbol}")
-
+            logger.info(f"EXECUTION SUCCESS: {side.upper()} order dispatched for {qty} {symbol}")
             return True, qty, price
 
         except Exception as e:
-            logger.error(f"Order failed: {e}")
+            logger.error(f"Order submission crashed: {e}")
             return False, 0, 0
 
     # ==========================================================================
@@ -441,57 +383,36 @@ class AlpacaCryptoBot:
     # ==========================================================================
 
     async def calculate_unrealized_pnl(self):
-
         total = 0.0
-
         positions = await self.get_positions_cache()
 
         for symbol in self.symbols:
-
             norm = self.normalize_symbol(symbol)
-
             if norm not in positions:
                 continue
 
             current_price, _ = await self.fetch_crypto_data(symbol)
-
             if not current_price:
                 continue
 
             entry = positions[norm]["avg_price"]
-
             qty = positions[norm]["qty"]
-
             pnl = (current_price - entry) * qty
-
             total += pnl
-
         return total
 
     async def check_risk_limits(self):
-
         unrealized = await self.calculate_unrealized_pnl()
-
         combined = self.daily_pnl + unrealized
 
         if combined <= self.max_unrealized_drawdown:
-
-            logger.error(
-                f"MAX DRAWDOWN HIT: ${combined:.2f}"
-            )
-
+            logger.error(f"CRITICAL STOP: Max Drawdown Limit Breached! Current: ${combined:.2f}")
             self.running = False
-
             return False
 
         if self.daily_pnl <= self.daily_loss_limit:
-
-            logger.error(
-                f"DAILY LOSS LIMIT HIT: ${self.daily_pnl:.2f}"
-            )
-
+            logger.error(f"CRITICAL STOP: Daily Loss Limit Hit! Current: ${self.daily_pnl:.2f}")
             self.running = False
-
             return False
 
         return True
@@ -501,202 +422,107 @@ class AlpacaCryptoBot:
     # ==========================================================================
 
     async def run(self):
-
-        logger.info("Bot started")
-
+        logger.info("Bot execution loop initialized.")
         last_cycle = 0
-
         interval_seconds = self.interval_minutes * 60
+        last_heartbeat = 0
 
         while self.running:
-
             try:
-
                 if not await self.check_risk_limits():
                     break
 
                 now = time.time()
 
-                if now - last_cycle >= interval_seconds:
+                # Print a heartbeat status message every 30 seconds so you know it is running
+                if now - last_heartbeat >= 30:
+                    time_remaining = max(0, interval_seconds - (now - last_cycle))
+                    logger.info(f"[Heartbeat] Bot is alive. Next scan in {int(time_remaining)} seconds. Active positions tracked: {len(self.positions)}")
+                    last_heartbeat = now
 
+                if now - last_cycle >= interval_seconds:
                     last_cycle = now
+                    logger.info(">>> Beginning Market Scan Cycle <<<")
 
                     positions_cache = await self.get_positions_cache()
 
                     for symbol in self.symbols:
-
                         try:
-
-                            # cooldown
-
                             if symbol in self.cooldowns:
-
                                 if datetime.now() < self.cooldowns[symbol]:
                                     continue
-
                                 del self.cooldowns[symbol]
 
-                            # market data
-
                             price, df = await self.fetch_crypto_data(symbol)
-
                             if price is None:
                                 continue
 
-                            # ML score
-
                             score = self.ml.predict(symbol, df)
-
                             norm = self.normalize_symbol(symbol)
-
                             has_position = norm in positions_cache
 
                             # =========================
                             # SELL LOGIC
                             # =========================
-
                             if has_position:
-
                                 qty = positions_cache[norm]["qty"]
-
                                 entry_price = positions_cache[norm]["avg_price"]
+                                pnl_pct = ((price - entry_price) / entry_price)
+                                pnl_usd = ((price - entry_price) * qty)
 
-                                pnl_pct = (
-                                    (price - entry_price)
-                                    / entry_price
-                                )
+                                stop_loss_hit = (pnl_pct <= self.stop_loss_pct)
+                                take_profit_hit = (pnl_pct >= self.take_profit_pct)
+                                sell_signal = (score < self.sell_threshold)
 
-                                pnl_usd = (
-                                    (price - entry_price)
-                                    * qty
-                                )
+                                logger.info(f"Tracking {symbol} | Price: ${price:.2f} | Entry: ${entry_price:.2f} | PnL: {pnl_pct*100:.2f}% | ML Score: {score:.3f}")
 
-                                stop_loss_hit = (
-                                    pnl_pct <= self.stop_loss_pct
-                                )
-
-                                take_profit_hit = (
-                                    pnl_pct >= self.take_profit_pct
-                                )
-
-                                sell_signal = (
-                                    score < self.sell_threshold
-                                )
-
-                                if (
-                                    stop_loss_hit
-                                    or take_profit_hit
-                                    or sell_signal
-                                ):
-
-                                    success, fill_qty, fill_price = (
-                                        await self.submit_order(
-                                            symbol,
-                                            "sell"
-                                        )
-                                    )
+                                if stop_loss_hit or take_profit_hit or sell_signal:
+                                    logger.info(f"Exit triggered for {symbol}. Reason -> SL: {stop_loss_hit}, TP: {take_profit_hit}, Signal: {sell_signal}")
+                                    success, fill_qty, fill_price = await self.submit_order(symbol, "sell")
 
                                     if success:
-
                                         self.total_pnl += pnl_usd
-
                                         self.daily_pnl += pnl_usd
-
                                         self.daily_trade_count += 1
 
-                                        logger.info(
-                                            f"SELL {symbol} | "
-                                            f"PnL ${pnl_usd:.2f}"
-                                        )
-
                                         write_trade_to_csv(
-                                            symbol,
-                                            "SELL",
-                                            fill_price,
-                                            fill_qty,
-                                            pnl_usd,
-                                            self.total_pnl,
-                                            score,
-                                            stop_loss_hit,
-                                            take_profit_hit
+                                            symbol, "SELL", fill_price, fill_qty, pnl_usd,
+                                            self.total_pnl, score, stop_loss_hit, take_profit_hit
                                         )
 
-                                        # Clear state memory tracking to avoid bloating tracking dictionary
                                         if symbol in self.positions:
                                             del self.positions[symbol]
 
-                                        self.cooldowns[symbol] = (
-                                            datetime.now()
-                                            + timedelta(hours=1)
-                                        )
+                                        self.cooldowns[symbol] = datetime.now() + timedelta(hours=1)
 
                             # =========================
                             # BUY LOGIC
                             # =========================
-
                             else:
-
-                                if (
-                                    score > self.buy_threshold
-                                    and self.daily_trade_count
-                                    < self.max_daily_trades
-                                ):
-
-                                    success, fill_qty, fill_price = (
-                                        await self.submit_order(
-                                            symbol,
-                                            "buy",
-                                            self.position_usd
-                                        )
-                                    )
+                                if score > self.buy_threshold and self.daily_trade_count < self.max_daily_trades:
+                                    logger.info(f"Buy threshold crossed for {symbol}. Current ML Score: {score:.3f}")
+                                    success, fill_qty, fill_price = await self.submit_order(symbol, "buy", self.position_usd)
 
                                     if success:
-
-                                        logger.info(
-                                            f"BUY {symbol} "
-                                            f"{fill_qty} @ ${fill_price:.2f}"
-                                        )
-
-                                        write_trade_to_csv(
-                                            symbol,
-                                            "BUY",
-                                            fill_price,
-                                            fill_qty,
-                                            score=score
-                                        )
-
+                                        write_trade_to_csv(symbol, "BUY", fill_price, fill_qty, score=score)
                                         self.daily_trade_count += 1
-
-                                        self.cooldowns[symbol] = (
-                                            datetime.now()
-                                            + timedelta(hours=1)
-                                        )
-
+                                        self.cooldowns[symbol] = datetime.now() + timedelta(hours=1)
                                         self.positions[symbol] = {
-                                            "entry_time":
-                                            datetime.now().isoformat(),
-
-                                            "reconcile_after":
-                                            (
-                                                datetime.now()
-                                                + timedelta(minutes=2)
-                                            ).isoformat()
+                                            "entry_time": datetime.now().isoformat(),
+                                            "reconcile_after": (datetime.now() + timedelta(minutes=2)).isoformat()
                                         }
 
                             self.save_state()
 
                         except Exception as e:
+                            logger.error(f"{symbol} processing failed inside loop: {e}")
 
-                            logger.error(
-                                f"{symbol} processing failed: {e}"
-                            )
+                    logger.info(">>> Market Scan Cycle Completed <<<")
 
                 await asyncio.sleep(1)
 
             except Exception as e:
-
-                logger.error(f"Main loop error: {e}")
-
+                logger.error(f"Main loop encountered top-level error: {e}")
                 await asyncio.sleep(5)
 
     # ==========================================================================
@@ -704,26 +530,18 @@ class AlpacaCryptoBot:
     # ==========================================================================
 
     def stop(self):
-
         self.running = False
-
         self.save_state()
-
-        logger.info(
-            f"Stopped | Total PnL: ${self.total_pnl:.2f}"
-        )
+        logger.info(f"Shutdown sequence complete. Finalizing session. Total PnL: ${self.total_pnl:.2f}")
 
 # ==============================================================================
 # ENTRY
 # ==============================================================================
 
 if __name__ == "__main__":
-
     bot = AlpacaCryptoBot()
-
     try:
         asyncio.run(bot.run())
-
     except KeyboardInterrupt:
         bot.stop()
 
