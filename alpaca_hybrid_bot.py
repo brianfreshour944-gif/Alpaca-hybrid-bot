@@ -1,6 +1,3 @@
-python
-#!/usr/bin/env python3
-
 import asyncio
 import pandas as pd
 import numpy as np
