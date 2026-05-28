@@ -50,7 +50,7 @@ def write_trade_to_csv(symbol, side, price, pnl_usd=None, total_pnl=None, score=
         ])
 
 # ==============================================================================
-# HYBRID PREDICTOR (unchanged)
+# HYBRID PREDICTOR
 # ==============================================================================
 
 class HybridPredictor:
@@ -149,7 +149,7 @@ class AlpacaCryptoBot:
         # STRATEGY SETTINGS
         self.buy_threshold = 0.51
         self.sell_threshold = 0.49
-        self.position_usd = 15            # reduced to preserve capital
+        self.position_usd = 15            
         self.min_buying_power_reserve = 20
 
         # API KEYS
@@ -177,9 +177,9 @@ class AlpacaCryptoBot:
         # SYMBOLS
         self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'LTC/USD']
         self.ml = HybridPredictor()
-        self.positions = {}        # symbol -> {price, entry_time, entry_score}
+        self.positions = {}        
         self.trades = []
-        self.cooldowns = {}         # symbol -> datetime until cooldown expires
+        self.cooldowns = {}         
         self.global_cooldown_until = None
         self.running = True
         self.total_pnl = 0.0
@@ -238,7 +238,6 @@ class AlpacaCryptoBot:
         return 0
 
     def verify_position_exists(self, symbol):
-        """Wait a few seconds and confirm the position is present in Alpaca."""
         for attempt in range(3):
             time.sleep(2)
             qty = self.get_position_qty(symbol)
@@ -256,7 +255,6 @@ class AlpacaCryptoBot:
                 logger.error("Trading client not initialized")
                 return False
 
-            # For buy orders, verify sufficient buying power
             if side == 'buy':
                 buying_power = self.get_buying_power()
                 if buying_power < self.min_buying_power_reserve:
@@ -268,7 +266,6 @@ class AlpacaCryptoBot:
                     self.global_cooldown_until = datetime.now() + timedelta(minutes=30)
                     return False
 
-            # Get current price
             price = self.get_current_price(symbol)
             if not price:
                 logger.error(f"Cannot get price for {symbol}")
@@ -291,7 +288,6 @@ class AlpacaCryptoBot:
             order = self.trading_client.submit_order(order_data)
             logger.info(f"✅ ORDER EXECUTED | {side.upper()} {qty} {symbol} | Order ID: {order.id}")
 
-            # After a buy, verify that the position actually appears in Alpaca
             if side == 'buy':
                 if not self.verify_position_exists(symbol):
                     logger.error(f"⚠️ Position for {symbol} did not appear after buy – marking cooldown")
@@ -301,7 +297,6 @@ class AlpacaCryptoBot:
 
         except Exception as e:
             logger.error(f"❌ Order failed for {symbol}: {e}")
-            # On any order failure, activate per‑symbol cooldown
             self.cooldowns[symbol] = datetime.now() + timedelta(hours=1)
             return False
 
@@ -367,7 +362,6 @@ class AlpacaCryptoBot:
                 if now - last_cycle >= interval_seconds:
                     last_cycle = now
 
-                    # Global cooldown
                     if self.global_cooldown_until and datetime.now() < self.global_cooldown_until:
                         remaining = (self.global_cooldown_until - datetime.now()).total_seconds()
                         logger.info(f"🌍 Global cooldown: {remaining:.0f}s – skipping")
@@ -378,7 +372,6 @@ class AlpacaCryptoBot:
 
                     for symbol in self.symbols:
                         try:
-                            # Per‑symbol cooldown
                             if symbol in self.cooldowns:
                                 if datetime.now() < self.cooldowns[symbol]:
                                     remaining = (self.cooldowns[symbol] - datetime.now()).total_seconds()
@@ -387,7 +380,6 @@ class AlpacaCryptoBot:
                                 else:
                                     del self.cooldowns[symbol]
 
-                            # Fetch data
                             price, df = await self.fetch_crypto_data(symbol)
                             if price is None or df is None:
                                 continue
@@ -421,7 +413,6 @@ class AlpacaCryptoBot:
                                 if self.trading_client:
                                     success = self.submit_crypto_order(symbol, self.position_usd, 'buy')
                                     if success:
-                                        # Once bought, add a 1‑hour cooldown to prevent any immediate re‑buy
                                         self.cooldowns[symbol] = datetime.now() + timedelta(hours=1)
                                         self.positions[symbol] = {
                                             'price': price,
@@ -431,7 +422,6 @@ class AlpacaCryptoBot:
                                         write_trade_to_csv(symbol, 'BUY', price, score=score)
                                         self.save_state()
                                     else:
-                                        # Order failed – already added cooldown inside submit_crypto_order
                                         pass
 
                         except Exception as e:
