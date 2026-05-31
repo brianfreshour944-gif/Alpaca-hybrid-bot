@@ -1,5 +1,5 @@
 
-rypto mean reversion alpaca · PY
+crypto mean reversion alpaca · PY
 #!/usr/bin/env python3
 # crypto_mean_reversion_alpaca.py
 #
