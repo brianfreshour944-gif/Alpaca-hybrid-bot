@@ -548,7 +548,7 @@ class MeanReversionBot:
                 # Daily loss guard
                 if self.daily_pnl <= DAILY_LOSS_LIMIT:
                     logger.error(f'Daily loss limit hit (${self.daily_pnl:.2f}) — pausing 1h')
-                    await asyncio.sleep(3600)
+                    await asyncio.sleep(300)
                     continue
 
                 # Wait for next cycle
