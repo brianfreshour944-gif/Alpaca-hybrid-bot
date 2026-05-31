@@ -63,7 +63,7 @@ BASELINE_PCT     = 0.30
 SYMBOLS     = ['BTC/USD', 'ETH/USD', 'SOL/USD']
 BTC_SYMBOL  = 'BTC/USD'
 WARMUP_BARS = 60
-CYCLE_SECS  = 3600   # 1-hour bars
+CYCLE_SECS  = 300   # 5-minute bars (was 3600 = 1 hour)
 
 # ==============================================================================
 # CSV
