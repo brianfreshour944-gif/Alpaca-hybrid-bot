@@ -1,576 +1,363 @@
-import asyncio
-import pandas as pd
-import numpy as np
-import logging
-import json
-import os
-import csv
-import time
 
-from datetime import datetime, timedelta
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
 
-from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest
-from alpaca.data.timeframe import TimeFrame
+# region imports
+from AlgorithmImports import *
+from collections import defaultdict
+from typing import Dict, List, Any, Tuple
+# endregion
 
-# ==============================================================================
-# LOGGING
-# ==============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger(__name__)
+class CryptoMeanReversionBot(QCAlgorithm):
+    """
+    Crypto mean-reversion bot — v3: extreme selectivity.
+    Only trades panic dips in strong uptrends.
 
-# ==============================================================================
-# CSV LOGGING
-# ==============================================================================
+    New: 20% baseline BTC hold to capture market beta during cash periods.
+    """
 
-def init_csv():
-    if not os.path.exists("trades.csv"):
-        with open("trades.csv", "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "Timestamp", "Symbol", "Side", "Price", "Qty",
-                "PnL_USD", "Total_PnL_USD", "ExitReason",
-                "StopPrice", "TargetPrice"
-            ])
+    def initialize(self) -> None:
+        self.set_start_date(2023, 1, 1)
+        self.set_account_currency("USD", 100_000)
+        self.set_brokerage_model(BrokerageName.BITFINEX, AccountType.CASH)
+        self.settings.free_portfolio_value_percentage = 0.02
 
-def write_trade_to_csv(symbol, side, price, qty,
-                       pnl_usd=None, total_pnl=None,
-                       exit_reason=None, stop_price=None, target_price=None):
-    with open("trades.csv", "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            symbol, side, price, qty,
-            pnl_usd      if pnl_usd      is not None else "",
-            total_pnl    if total_pnl    is not None else "",
-            exit_reason  if exit_reason  is not None else "",
-            stop_price   if stop_price   is not None else "",
-            target_price if target_price is not None else "",
-        ])
+        # Tunables
+        self._buy_threshold      = 0.80
+        self._min_hold_bars      = 24
+        self._max_hold_bars      = 168
+        self._atr_stop_mult      = 1.5
+        self._atr_target_mult    = 8.0
+        self._daily_loss_limit   = -5_000.0
+        self._position_pct       = 0.40
+        self._cooldown_hours     = 48
+        self._min_atr_pct        = 0.015
+        self._baseline_pct       = 0.30
 
-# ==============================================================================
-# INDICATORS
-# ==============================================================================
+        # Assets
+        self._symbols_raw = ["BTCUSD", "ETHUSD", "SOLUSD"]
+        self._symbols: List[Symbol] = []
+        for raw in self._symbols_raw:
+            sec = self.add_crypto(raw, Resolution.HOUR)
+            self._symbols.append(sec.symbol)
 
-def calc_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50.0
-    deltas   = np.diff(prices)
-    gains    = np.where(deltas > 0, deltas, 0.0)
-    losses   = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    if avg_loss == 0:
-        return 100.0
-    return 100.0 - 100.0 / (1 + avg_gain / avg_loss)
+        self._btc_sym = self._symbols[0]
+        self.set_benchmark(self._btc_sym)
 
-def calc_ema(prices, period):
-    return pd.Series(prices).ewm(span=period, adjust=False).mean().values
+        # Warm-up windows
+        self._warmup_period = 60
+        self._prices:  Dict[Symbol, RollingWindow] = {}
+        self._highs:   Dict[Symbol, RollingWindow] = {}
+        self._lows:    Dict[Symbol, RollingWindow] = {}
+        self._volumes: Dict[Symbol, RollingWindow] = {}
+        for sym in self._symbols:
+            self._prices[sym]  = RollingWindow(self._warmup_period)
+            self._highs[sym]   = RollingWindow(self._warmup_period)
+            self._lows[sym]    = RollingWindow(self._warmup_period)
+            self._volumes[sym] = RollingWindow(self._warmup_period)
 
-def calc_atr(prices, period=14):
-    """ATR approximation from close-to-close moves."""
-    if len(prices) < period + 1:
-        return prices[-1] * 0.001
-    diffs = np.abs(np.diff(prices[-(period + 1):]))
-    return float(np.mean(diffs))
+        # State — only one mean-reversion position at a time
+        self._position: Dict[str, Any] = {}
+        self._global_cooldown: datetime = datetime.min
+        self._daily_pnl = 0.0
+        self._current_day = self.time.date()
 
-# ==============================================================================
-# STRATEGY v2
-# ==============================================================================
-# Entry logic (all must pass):
-#   HARD GATES:
-#     1. EMA9 > EMA21 (uptrend — never buy into a downtrend)
-#     2. RSI < 50 AND RSI is rising (momentum turning up)
-#   SCORING GATE (need >= 2 of 4 points):
-#     +1  z-score < -0.8  (price pulling back below mean)
-#     +1  z-score < -1.2  (extra credit for stronger pullback)
-#     +1  MACD histogram rising (momentum confirming)
-#     +1  volume surge >= 1.2x (volume present)
-#
-# Exit logic:
-#   STOP LOSS:   price <= entry - 1.5 * ATR  (dynamic, fires immediately)
-#   TAKE PROFIT: price >= entry + 2.5 * ATR  (dynamic, fires immediately)
-#   SIGNAL EXIT: only after 5+ bars held, when z > 0.5 OR downtrend OR RSI > 60
-#
-# Why this beats the old approach:
-#   Old bot: SL/TP never fired (too wide for 1-min bars), exited on signal noise
-#            → wins: ~0.1%, losses: ~0.3% → losing money despite 68% win rate
-#   v2:      ATR stops match bar volatility, R:R ~1.2-1.5:1, breakeven at 45%
-#            → backtest: +$0.31 across all 4 symbols vs -$0.54 for old fixed
-# ==============================================================================
+        self.schedule.on(
+            self.date_rules.every_day(),
+            self.time_rules.every(TimeSpan.from_hours(1)),
+            self._rebalance
+        )
 
-class StrategyV2:
+        self.set_warm_up(self._warmup_period, Resolution.HOUR)
 
-    def check_entry(self, close_arr, vol_arr):
-        """
-        Returns (should_buy, stop_price, target_price) or (False, 0, 0).
-        """
-        if len(close_arr) < 50:
-            return False, 0, 0
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-        price = close_arr[-1]
+    def _reset_daily_counters(self) -> None:
+        today = self.time.date()
+        if today != self._current_day:
+            self._daily_pnl = 0.0
+            self._current_day = today
+            self.log(f"New trading day: {today}")
 
-        ma20  = np.mean(close_arr[-20:])
-        std20 = np.std(close_arr[-20:])
-        z     = (price - ma20) / std20 if std20 > 0 else 0
+    def _in_global_cooldown(self) -> bool:
+        return self.time < self._global_cooldown
 
-        rsi_now  = calc_rsi(close_arr)
-        rsi_prev = calc_rsi(close_arr[:-1])
-        rsi_rising = rsi_now > rsi_prev
+    def _calc_rsi(self, prices: list, period: int = 14) -> float:
+        if len(prices) < period + 1:
+            return 50.0
+        deltas = np.diff(prices[-(period + 1):])
+        gains = deltas[deltas > 0]
+        losses = -deltas[deltas < 0]
+        avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
+        avg_loss = np.mean(losses) if len(losses) > 0 else 0.0
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
 
-        ema9  = calc_ema(close_arr, 9)
-        ema21 = calc_ema(close_arr, 21)
-        in_uptrend = ema9[-1] > ema21[-1]
+    def _calc_ema(self, prices: list, period: int) -> float:
+        if len(prices) < period:
+            return prices[-1]
+        alpha = 2.0 / (period + 1)
+        ema = prices[0]
+        for p in prices[1:]:
+            ema = p * alpha + ema * (1 - alpha)
+        return ema
 
-        ema12 = calc_ema(close_arr, 12)
-        ema26 = calc_ema(close_arr, 26)
-        macd  = ema12 - ema26
-        macd_rising = macd[-1] > macd[-2]
+    def _calc_sma(self, prices: list, period: int) -> float:
+        if len(prices) < period:
+            return prices[-1] if prices else 0.0
+        return float(np.mean(prices[-period:]))
 
-        vol_avg   = np.mean(vol_arr[-10:])
-        vol_surge = vol_arr[-1] / vol_avg if vol_avg > 0 else 1
-
-        atr = calc_atr(close_arr, 14)
-
-        # Hard gates
-        if not in_uptrend:
-            return False, 0, 0
-        if not (rsi_now < 50 and rsi_rising):
-            return False, 0, 0
-
-        # Scoring gate
-        score = 0
-        if z < -0.8:  score += 1
-        if z < -1.2:  score += 1
-        if macd_rising: score += 1
-        if vol_surge >= 1.2: score += 1
-
-        if score < 2:
-            return False, 0, 0
-
-        stop_price   = price - atr * 1.5
-        target_price = price + atr * 2.5
-        return True, stop_price, target_price
-
-    def check_exit(self, close_arr, price, entry_price,
-                   stop_price, target_price, bars_held):
-        """
-        Returns (should_exit, reason).
-        """
-        # ATR stops — fire immediately
-        if price <= stop_price:
-            return True, "STOP_LOSS"
-        if price >= target_price:
-            return True, "TAKE_PROFIT"
-
-        # Signal exit only after minimum hold
-        if bars_held >= 5:
-            ma20  = np.mean(close_arr[-20:])
-            std20 = np.std(close_arr[-20:])
-            z     = (price - ma20) / std20 if std20 > 0 else 0
-            rsi   = calc_rsi(close_arr)
-            ema9  = calc_ema(close_arr, 9)
-            ema21 = calc_ema(close_arr, 21)
-            in_downtrend = ema9[-1] < ema21[-1]
-
-            if z > 0.5 or in_downtrend or rsi > 60:
-                return True, "SIGNAL_EXIT"
-
-        return False, None
-
-# ==============================================================================
-# MAIN BOT
-# ==============================================================================
-
-class AlpacaCryptoBot:
-
-    def __init__(self):
-
-        self.paper_mode       = True
-        self.interval_minutes = 5
-        self.position_usd     = 15
-
-        # RISK
-        self.daily_loss_limit         = -30.0
-        self.max_daily_trades         = 20
-        self.max_unrealized_drawdown  = -50.0
-        self.min_buying_power_reserve = 20
-
-        # API
-        self.api_key    = os.getenv("APCA_API_KEY_ID", "")
-        self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
-
-        self.trading_client = None
-        self.data_client    = CryptoHistoricalDataClient()
-
-        if self.api_key and self.secret_key:
-            self.trading_client = TradingClient(
-                self.api_key, self.secret_key, paper=self.paper_mode
+    def _calc_atr(self, highs: list, lows: list, closes: list, period: int = 14) -> float:
+        if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
+            return closes[-1] * 0.01 if closes else 1.0
+        high_arr  = np.array(highs[-(period + 1):])
+        low_arr   = np.array(lows[-(period + 1):])
+        close_arr = np.array(closes[-(period + 1):])
+        tr = np.maximum(
+            high_arr[1:] - low_arr[1:],
+            np.maximum(
+                np.abs(high_arr[1:] - close_arr[:-1]),
+                np.abs(low_arr[1:] - close_arr[:-1])
             )
-            logger.info("Connected to Alpaca Trading API.")
+        )
+        return float(np.mean(tr))
+
+    def _compute_score(self, sym: Symbol) -> float:
+        prices  = list(self._prices[sym])
+        volumes = list(self._volumes[sym])
+        if len(prices) < 50 or len(volumes) < 10:
+            return 0.0
+
+        close = np.array(prices)
+        ma20  = np.mean(close[-20:])
+        std20 = np.std(close[-20:])
+        z_score = (close[-1] - ma20) / std20 if std20 > 0 else 0.0
+
+        rsi_val = self._calc_rsi(prices)
+        ema9    = self._calc_ema(prices, 9)
+        ema21   = self._calc_ema(prices, 21)
+        is_uptrend = ema9 > ema21 and close[-1] > ema9
+
+        vol_arr = np.array(volumes)
+        vol_avg = np.mean(vol_arr[-10:]) if len(vol_arr) >= 10 else 1.0
+        vol_surge = vol_arr[-1] / vol_avg if vol_avg > 0 else 1.0
+
+        score = 0.5
+
+        if is_uptrend:
+            if z_score < -2.0:
+                score += 0.30
+            elif z_score < -1.5:
+                score += 0.22
+            elif z_score < -1.0:
+                score += 0.15
+            elif z_score < -0.5:
+                score += 0.08
+            elif z_score > 1.5:
+                score -= 0.25
+            elif z_score > 1.0:
+                score -= 0.15
+            elif z_score > 0.5:
+                score -= 0.08
+            score += 0.08
         else:
-            logger.warning("No Alpaca API keys found in environment variables.")
+            if z_score < -2.0:
+                score += 0.20
+            elif z_score < -1.5:
+                score += 0.12
+            elif z_score > 1.0:
+                score -= 0.25
+            elif z_score > 0.5:
+                score -= 0.15
 
-        self.symbols = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD"]
+        if rsi_val < 30:
+            score += 0.12
+        elif rsi_val < 40:
+            score += 0.06
+        elif rsi_val > 70:
+            score -= 0.12
+        elif rsi_val > 60:
+            score -= 0.06
 
-        self.strategy            = StrategyV2()
-        self.positions           = {}   # symbol → {entry_time, stop_price, target_price, bars_held}
-        self.cooldowns           = {}
-        self.total_pnl           = 0.0
-        self.daily_pnl           = 0.0
-        self.daily_trade_count   = 0
-        self.current_day         = datetime.now().date()
-        self.running             = True
+        if vol_surge > 1.5:
+            score += 0.03
 
-        init_csv()
-        self.load_state()
+        return max(0.0, min(1.0, score))
 
-    # ==========================================================================
-    # STATE
-    # ==========================================================================
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
 
-    def save_state(self):
-        cooldowns_serial = {s: dt.isoformat() for s, dt in self.cooldowns.items()}
-        with open("alpaca_crypto_state.json", "w") as f:
-            json.dump({
-                "positions":         self.positions,
-                "cooldowns":         cooldowns_serial,
-                "total_pnl":         self.total_pnl,
-                "daily_pnl":         self.daily_pnl,
-                "daily_trade_count": self.daily_trade_count,
-                "current_day":       self.current_day.isoformat(),
-            }, f)
+    def on_data(self, data: Slice) -> None:
+        for sym in self._symbols:
+            bar = data.bars.get(sym)
+            if bar is None:
+                continue
+            self._prices[sym].add(bar.close)
+            self._highs[sym].add(bar.high)
+            self._lows[sym].add(bar.low)
+            self._volumes[sym].add(bar.volume)
 
-    def load_state(self):
-        if not os.path.exists("alpaca_crypto_state.json"):
-            logger.info("No prior state — starting fresh.")
+    # ------------------------------------------------------------------
+    # Rebalance logic (called every hour)
+    # ------------------------------------------------------------------
+
+    def _rebalance(self) -> None:
+        self._reset_daily_counters()
+
+        # Maintain baseline BTC hold
+        self._maintain_baseline()
+
+        if self._daily_pnl <= self._daily_loss_limit:
+            self.log("Daily loss limit hit.")
             return
-        try:
-            with open("alpaca_crypto_state.json", "r") as f:
-                data = json.load(f)
-            self.positions         = data.get("positions", {})
-            self.total_pnl         = data.get("total_pnl", 0.0)
-            self.daily_pnl         = data.get("daily_pnl", 0.0)
-            self.daily_trade_count = data.get("daily_trade_count", 0)
-            self.current_day       = datetime.fromisoformat(data["current_day"]).date()
-            now = datetime.now()
-            self.cooldowns = {
-                s: datetime.fromisoformat(v)
-                for s, v in data.get("cooldowns", {}).items()
-                if datetime.fromisoformat(v) > now
-            }
-            logger.info(
-                f"State loaded — trades today: {self.daily_trade_count}, "
-                f"daily P&L: ${self.daily_pnl:.2f}"
-            )
-        except Exception as e:
-            logger.error(f"State load failed: {e}")
 
-    # ==========================================================================
-    # ACCOUNT
-    # ==========================================================================
+        # If in a mean-reversion position, manage it
+        if self._position:
+            self._manage_position()
+            return
 
-    async def get_positions_cache(self):
-        try:
-            positions = self.trading_client.get_all_positions()
-            return {
-                p.symbol.replace("/", ""): {
-                    "qty":       float(p.qty),
-                    "avg_price": float(p.avg_entry_price),
-                }
-                for p in positions
-            }
-        except Exception as e:
-            logger.error(f"Position cache error: {e}")
-            return {}
+        # Not in a mean-reversion position — look for best entry
+        if self._in_global_cooldown():
+            return
 
-    @staticmethod
-    def normalize_symbol(symbol):
-        return symbol.replace("/", "").replace("-", "")
+        # Reserve baseline cash + buffer for the trade
+        available_cash = self.portfolio.cash
+        baseline_notional = self.portfolio.total_portfolio_value * self._baseline_pct
+        baseline_value = self.portfolio[self._btc_sym].holdings_value
+        cash_needed_for_baseline = max(0, baseline_notional - baseline_value)
+        trade_reserve = self.portfolio.total_portfolio_value * self._position_pct * 1.05
+        if available_cash < cash_needed_for_baseline + trade_reserve:
+            return
 
-    # ==========================================================================
-    # DATA
-    # ==========================================================================
-
-    async def fetch_crypto_data(self, symbol):
-        try:
-            req  = CryptoBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Minute,
-                limit=100,
-            )
-            bars = self.data_client.get_crypto_bars(req)
-            if symbol not in bars.data:
-                return None, None
-            rows = bars.data[symbol]
-            df = pd.DataFrame({
-                "close":  [b.close  for b in rows],
-                "volume": [b.volume for b in rows],
-            })
-            return rows[-1].close, df
-        except Exception as e:
-            logger.error(f"{symbol} data fetch failed: {e}")
-            return None, None
-
-    # ==========================================================================
-    # ORDERS
-    # ==========================================================================
-
-    async def submit_order(self, symbol, side, usd_amount=None):
-        try:
-            price, _ = await self.fetch_crypto_data(symbol)
-            if not price:
-                return False, 0, 0
-
-            if side == "buy":
-                qty = round((usd_amount / price) - 0.0000005, 6)
-            else:
-                positions = await self.get_positions_cache()
-                norm = self.normalize_symbol(symbol)
-                if norm not in positions:
-                    logger.error(f"Aborting sell — no exchange position for {symbol}")
-                    return False, 0, 0
-                raw_qty = positions[norm]["qty"]
-                qty = round(raw_qty - 0.0000005, 6)
-                if qty <= 0:
-                    qty = raw_qty
-
-            order = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-            )
-            self.trading_client.submit_order(order)
-            logger.info(f"ORDER: {side.upper()} {qty} {symbol} @ ~${price:.4f}")
-            return True, qty, price
-        except Exception as e:
-            logger.error(f"Order failed: {e}")
-            return False, 0, 0
-
-    # ==========================================================================
-    # RISK
-    # ==========================================================================
-
-    async def calculate_unrealized_pnl(self):
-        total = 0.0
-        positions = await self.get_positions_cache()
-        for symbol in self.symbols:
-            norm = self.normalize_symbol(symbol)
-            if norm not in positions:
+        # Score all symbols and pick the best
+        candidates: List[Tuple[Symbol, float, float]] = []
+        for sym in self._symbols:
+            price = self.securities[sym].price
+            if price == 0:
                 continue
-            price, _ = await self.fetch_crypto_data(symbol)
-            if not price:
-                continue
-            entry = positions[norm]["avg_price"]
-            qty   = positions[norm]["qty"]
-            total += (price - entry) * qty
-        return total
+            score = self._compute_score(sym)
+            candidates.append((sym, score, price))
 
-    async def check_risk_limits(self):
-        unrealized = await self.calculate_unrealized_pnl()
-        combined   = self.daily_pnl + unrealized
+        if not candidates:
+            return
 
-        if combined <= self.max_unrealized_drawdown:
-            logger.error(f"CRITICAL STOP: max drawdown breached (${combined:.2f})")
-            self.running = False
-            return False
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_sym, best_score, best_price = candidates[0]
 
-        if self.daily_pnl <= self.daily_loss_limit:
-            logger.error(f"CRITICAL STOP: daily loss limit hit (${self.daily_pnl:.2f})")
-            self.running = False
-            return False
+        if best_score <= self._buy_threshold:
+            return
 
-        return True
+        # Regime filter: price must be above 50-bar SMA
+        prices = list(self._prices[best_sym])
+        if len(prices) < 50:
+            return
+        sma50 = self._calc_sma(prices, 50)
+        if best_price <= sma50:
+            return
 
-    # ==========================================================================
-    # MAIN LOOP
-    # ==========================================================================
+        highs  = list(self._highs[best_sym])
+        lows   = list(self._lows[best_sym])
+        closes = list(self._prices[best_sym])
+        atr = self._calc_atr(highs, lows, closes, 14)
 
-    async def run(self):
-        logger.info("Bot v2 started.")
-        last_cycle     = 0
-        interval_secs  = self.interval_minutes * 60
-        last_heartbeat = 0
+        # Volatility filter
+        if atr < best_price * self._min_atr_pct:
+            self.log(f"Reject {best_sym.value} — ATR too low")
+            return
 
-        while self.running:
-            try:
-                if not await self.check_risk_limits():
-                    break
+        stop_price   = best_price - atr * self._atr_stop_mult
+        target_price = best_price + atr * self._atr_target_mult
 
-                now = time.time()
+        notional = self.portfolio.total_portfolio_value * self._position_pct
+        qty = notional / best_price
+        qty = round(qty, 6)
+        if qty <= 0:
+            return
 
-                # Heartbeat every 30 seconds
-                if now - last_heartbeat >= 30:
-                    remaining = max(0, interval_secs - (now - last_cycle))
-                    logger.info(
-                        f"[Heartbeat] Next scan in {int(remaining)}s | "
-                        f"Open positions: {len(self.positions)} | "
-                        f"Daily P&L: ${self.daily_pnl:.2f}"
-                    )
-                    last_heartbeat = now
+        self.log(
+            f"BUY {best_sym.value} @ {best_price:.2f} | score={best_score:.3f} "
+            f"SL={stop_price:.2f} TP={target_price:.2f}"
+        )
 
-                if now - last_cycle >= interval_secs:
-                    last_cycle = now
+        ticket = self.market_order(best_sym, qty)
+        if ticket.status == OrderStatus.FILLED or ticket.status == OrderStatus.PARTIALLY_FILLED:
+            fill_price = ticket.average_fill_price if ticket.average_fill_price != 0 else best_price
+            self._position = {
+                "symbol":       best_sym,
+                "entry_time":   self.time,
+                "entry_price":  fill_price,
+                "stop_price":   stop_price,
+                "target_price": target_price,
+                "qty":          qty,
+                "bars_held":    0,
+            }
 
-                    # Reset daily counters at midnight
-                    today = datetime.now().date()
-                    if today != self.current_day:
-                        logger.info("New trading day — resetting daily counters.")
-                        self.daily_pnl         = 0.0
-                        self.daily_trade_count = 0
-                        self.current_day       = today
+    def _maintain_baseline(self) -> None:
+        """Keep a 20% BTC baseline position, rebalanced once per day."""
+        # Only check baseline at midnight UTC to avoid hourly churn
+        if self.time.hour != 0:
+            return
 
-                    logger.info(">>> Scan cycle started <<<")
-                    positions_cache = await self.get_positions_cache()
+        target_notional = self.portfolio.total_portfolio_value * self._baseline_pct
+        current_value = self.portfolio[self._btc_sym].holdings_value
+        price = self.securities[self._btc_sym].price
+        if price == 0:
+            return
 
-                    for symbol in self.symbols:
-                        try:
-                            # Cooldown check
-                            if symbol in self.cooldowns:
-                                if datetime.now() < self.cooldowns[symbol]:
-                                    continue
-                                del self.cooldowns[symbol]
+        diff_notional = target_notional - current_value
+        # Only act if deviation is > 2% of portfolio
+        if abs(diff_notional) < self.portfolio.total_portfolio_value * 0.02:
+            return
 
-                            price, df = await self.fetch_crypto_data(symbol)
-                            if price is None or df is None:
-                                continue
+        qty = diff_notional / price
+        qty = round(qty, 6)
+        if qty == 0:
+            return
 
-                            close_arr = df["close"].values
-                            vol_arr   = df["volume"].values
-                            norm      = self.normalize_symbol(symbol)
-                            has_pos   = norm in positions_cache
+        action = "BUY" if qty > 0 else "SELL"
+        self.log(f"BASELINE {action} BTC {abs(qty):.6f} @ {price:.2f}")
+        self.market_order(self._btc_sym, qty)
 
-                            # ================================================
-                            # MANAGE OPEN POSITION
-                            # ================================================
-                            if has_pos:
-                                qty        = positions_cache[norm]["qty"]
-                                avg_entry  = positions_cache[norm]["avg_price"]
-                                pnl_pct    = (price - avg_entry) / avg_entry
-                                pnl_usd    = (price - avg_entry) * qty
+    def _manage_position(self) -> None:
+        pos = self._position
+        sym = pos["symbol"]
+        price = self.securities[sym].price
+        if price == 0:
+            return
 
-                                # Retrieve stored stops for this symbol
-                                pos_data    = self.positions.get(symbol, {})
-                                stop_price  = pos_data.get("stop_price",   avg_entry * 0.96)
-                                target_price = pos_data.get("target_price", avg_entry * 1.08)
-                                bars_held   = pos_data.get("bars_held", 0)
+        pos["bars_held"] += 1
+        entry_price  = pos["entry_price"]
+        stop_price   = pos["stop_price"]
+        target_price = pos["target_price"]
+        bars_held    = pos["bars_held"]
+        qty          = pos["qty"]
 
-                                should_exit, reason = self.strategy.check_exit(
-                                    close_arr, price, avg_entry,
-                                    stop_price, target_price, bars_held
-                                )
+        exit_reason = None
 
-                                logger.info(
-                                    f"  {symbol} | ${price:.4f} | entry ${avg_entry:.4f} | "
-                                    f"P&L {pnl_pct*100:.2f}% | bars {bars_held} | "
-                                    f"SL ${stop_price:.4f} | TP ${target_price:.4f}"
-                                )
+        if price <= stop_price:
+            exit_reason = "STOP_LOSS"
+        elif price >= target_price:
+            exit_reason = "TARGET_HIT"
+        elif bars_held >= self._max_hold_bars:
+            exit_reason = "MAX_HOLD"
 
-                                # Increment bars held for next cycle
-                                if symbol in self.positions:
-                                    self.positions[symbol]["bars_held"] = bars_held + 1
+        if exit_reason:
+            self.log(f"EXIT {sym.value} — {exit_reason} @ {price:.2f}")
+            self.liquidate(sym)
+            pnl = (price - entry_price) * qty
+            self._daily_pnl += pnl
+            self._position = {}
+            self._global_cooldown = self.time + timedelta(hours=self._cooldown_hours)
+            self.log(f"Global cooldown {self._cooldown_hours}h ({exit_reason})")
 
-                                if should_exit:
-                                    logger.info(f"  EXIT {symbol} — {reason}")
-                                    success, fill_qty, fill_price = await self.submit_order(
-                                        symbol, "sell"
-                                    )
-                                    if success:
-                                        self.total_pnl         += pnl_usd
-                                        self.daily_pnl         += pnl_usd
-                                        self.daily_trade_count += 1
-                                        write_trade_to_csv(
-                                            symbol, "SELL", fill_price, fill_qty,
-                                            pnl_usd, self.total_pnl, reason,
-                                            stop_price, target_price
-                                        )
-                                        if symbol in self.positions:
-                                            del self.positions[symbol]
-                                        self.cooldowns[symbol] = (
-                                            datetime.now() + timedelta(hours=1)
-                                        )
-
-                            # ================================================
-                            # LOOK FOR NEW ENTRY
-                            # ================================================
-                            else:
-                                if self.daily_trade_count >= self.max_daily_trades:
-                                    continue
-
-                                should_buy, stop_price, target_price = (
-                                    self.strategy.check_entry(close_arr, vol_arr)
-                                )
-
-                                if should_buy:
-                                    logger.info(
-                                        f"  BUY {symbol} @ ${price:.4f} | "
-                                        f"SL ${stop_price:.4f} | TP ${target_price:.4f}"
-                                    )
-                                    success, fill_qty, fill_price = await self.submit_order(
-                                        symbol, "buy", self.position_usd
-                                    )
-                                    if success:
-                                        write_trade_to_csv(
-                                            symbol, "BUY", fill_price, fill_qty,
-                                            stop_price=stop_price,
-                                            target_price=target_price,
-                                        )
-                                        self.daily_trade_count += 1
-                                        self.cooldowns[symbol] = (
-                                            datetime.now() + timedelta(hours=1)
-                                        )
-                                        self.positions[symbol] = {
-                                            "entry_time":  datetime.now().isoformat(),
-                                            "stop_price":  stop_price,
-                                            "target_price": target_price,
-                                            "bars_held":   0,
-                                        }
-
-                            self.save_state()
-
-                        except Exception as e:
-                            logger.error(f"{symbol} loop error: {e}")
-
-                    logger.info(
-                        f">>> Scan cycle done | "
-                        f"Daily P&L: ${self.daily_pnl:.2f} | "
-                        f"Total P&L: ${self.total_pnl:.2f} <<<"
-                    )
-
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                logger.error(f"Top-level error: {e}")
-                await asyncio.sleep(5)
-
-    # ==========================================================================
-    # STOP
-    # ==========================================================================
-
-    def stop(self):
-        self.running = False
-        self.save_state()
-        logger.info(f"Shutdown complete. Total P&L: ${self.total_pnl:.2f}")
-
-
-# ==============================================================================
-# ENTRY
-# ==============================================================================
-
-if __name__ == "__main__":
-    bot = AlpacaCryptoBot()
-    try:
-        asyncio.run(bot.run())
-    except KeyboardInterrupt:
-        bot.stop()
-
-
+    def on_order_event(self, order_event: OrderEvent) -> None:
+        if order_event.status == OrderStatus.FILLED:
+            self.log(
+                f"FILL {order_event.symbol.value} "
+                f"{order_event.direction} {order_event.fill_quantity} @ {order_event.fill_price}"
+            )
