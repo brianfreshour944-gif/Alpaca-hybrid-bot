@@ -4,7 +4,6 @@ from typing import Dict, List, Any, Tuple
 # endregion
 
 
-    """
     Crypto mean-reversion bot — v3: extreme selectivity.
     Only trades panic dips in strong uptrends.
 
