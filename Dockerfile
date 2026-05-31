@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY alpaca_hybrid_bot.py .
+COPY crypto_mean_reversion_alpaca.py .
 
-CMD ["python", "-u", "alpaca_hybrid_bot.py"]
+# State files persist via Coolify volume mount at /app
+CMD ["python", "-u", "crypto_mean_reversion_alpaca.py"]
