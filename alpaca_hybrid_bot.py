@@ -1,3 +1,24 @@
+
+#!/usr/bin/env python3
+# crypto_mean_reversion_alpaca.py
+#
+# Port of CryptoMeanReversionBot (QuantConnect v3) → standalone Alpaca bot.
+# Runs on Oracle/Coolify or any Linux server with Python 3.10+.
+#
+# Same logic as the QC version:
+#   - z-score mean reversion + RSI + volume surge scoring
+#   - Regime filter: price above 50-bar SMA
+#   - ATR-based stop loss (1.5×) and take profit (8.0×)
+#   - 30% baseline BTC hold rebalanced daily
+#   - Only one mean-reversion position at a time
+#   - 48h cooldown after stop loss, 4h after win/timeout
+#
+# Setup:
+#   pip install alpaca-py pandas numpy
+#   export APCA_API_KEY_ID=your_key
+#   export APCA_API_SECRET_KEY=your_secret
+#   python crypto_mean_reversion_alpaca.py
+
 import asyncio
 import os
 import csv
