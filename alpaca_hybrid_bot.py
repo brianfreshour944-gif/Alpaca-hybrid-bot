@@ -1,23 +1,5 @@
-
 #!/usr/bin/env python3
 # crypto_mean_reversion_alpaca.py
-#
-# Port of CryptoMeanReversionBot (QuantConnect v3) → standalone Alpaca bot.
-# Runs on Oracle/Coolify or any Linux server with Python 3.10+.
-#
-# Same logic as the QC version:
-#   - z-score mean reversion + RSI + volume surge scoring
-#   - Regime filter: price above 50-bar SMA
-#   - ATR-based stop loss (1.5×) and take profit (8.0×)
-#   - 30% baseline BTC hold rebalanced daily
-#   - Only one mean-reversion position at a time
-#   - 48h cooldown after stop loss, 4h after win/timeout
-#
-# Setup:
-#   pip install alpaca-py pandas numpy
-#   export APCA_API_KEY_ID=your_key
-#   export APCA_API_SECRET_KEY=your_secret
-#   python crypto_mean_reversion_alpaca.py
 
 import asyncio
 import os
@@ -45,12 +27,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# CONFIG  — mirror of QC tunables
+# CONFIG  — Mirror of QC Tunables (Corrected for 5-Minute Timeframe Consistency)
 # ==============================================================================
 
 BUY_THRESHOLD    = 0.80
-MIN_HOLD_BARS    = 24
-MAX_HOLD_BARS    = 168
+MIN_HOLD_BARS    = 24    # 2 hours on a 5-min chart
+MAX_HOLD_BARS    = 168   # 14 hours on a 5-min chart
 ATR_STOP_MULT    = 1.5
 ATR_TARGET_MULT  = 8.0
 DAILY_LOSS_LIMIT = -5_000.0
@@ -63,10 +45,10 @@ BASELINE_PCT     = 0.30
 SYMBOLS     = ['BTC/USD', 'ETH/USD', 'SOL/USD']
 BTC_SYMBOL  = 'BTC/USD'
 WARMUP_BARS = 60
-CYCLE_SECS  = 300   # 5-minute bars (was 3600 = 1 hour)
+CYCLE_SECS  = 300  # 5-minute execution loop
 
 # ==============================================================================
-# CSV
+# CSV ENGINE
 # ==============================================================================
 
 def init_csv():
@@ -94,7 +76,7 @@ def write_trade(symbol, side, fill_price, qty=None, pnl=None, total_pnl=None,
         ])
 
 # ==============================================================================
-# INDICATORS  (all expect oldest-first lists)
+# INDICATORS
 # ==============================================================================
 
 def calc_rsi(prices: list, period: int = 14) -> float:
@@ -111,7 +93,7 @@ def calc_rsi(prices: list, period: int = 14) -> float:
 
 def calc_ema(prices: list, period: int) -> float:
     if len(prices) < period:
-        return prices[-1]
+        return prices[-1] if prices else 0.0
     alpha = 2.0 / (period + 1)
     ema   = prices[0]
     for p in prices[1:]:
@@ -180,7 +162,7 @@ def compute_score(prices: list, volumes: list) -> float:
     return max(0.0, min(1.0, score))
 
 # ==============================================================================
-# BOT
+# BOT ENGINE
 # ==============================================================================
 
 class MeanReversionBot:
@@ -194,27 +176,21 @@ class MeanReversionBot:
         self.trading = TradingClient(self.api_key, self.secret_key, paper=True)
         self.data    = CryptoHistoricalDataClient()
 
-        # Rolling windows — deque oldest-first (opposite of QC)
         self.closes  = {s: deque(maxlen=WARMUP_BARS) for s in SYMBOLS}
         self.highs   = {s: deque(maxlen=WARMUP_BARS) for s in SYMBOLS}
         self.lows    = {s: deque(maxlen=WARMUP_BARS) for s in SYMBOLS}
         self.volumes = {s: deque(maxlen=WARMUP_BARS) for s in SYMBOLS}
 
-        # State
         self.position: dict         = {}
         self.global_cooldown        = datetime.min.replace(tzinfo=timezone.utc)
         self.daily_pnl              = 0.0
         self.total_pnl              = 0.0
         self.current_day            = datetime.now(timezone.utc).date()
-        self.baseline_last_rebal    = None   # date of last BTC baseline rebalance
+        self.baseline_last_rebal    = None 
 
         init_csv()
         self.load_state()
-        logger.info('MeanReversionBot ready (paper=True)')
-
-    # ------------------------------------------------------------------
-    # State persistence
-    # ------------------------------------------------------------------
+        logger.info('MeanReversionBot ready (Fixed Timeframe Edition | paper=True)')
 
     def save_state(self):
         with open('bot_state.json', 'w') as f:
@@ -245,24 +221,20 @@ class MeanReversionBot:
         except Exception as e:
             logger.error(f'State load error: {e}')
 
-    # ------------------------------------------------------------------
-    # Data fetch
-    # ------------------------------------------------------------------
-
     async def fetch_bars(self, symbol: str) -> bool:
-        """Fetch last WARMUP_BARS hourly bars and update rolling windows."""
+        """Fetch last WARMUP_BARS 5-minute bars and update rolling windows."""
         try:
             loop = asyncio.get_running_loop()
             req  = CryptoBarsRequest(
                 symbol_or_symbols=symbol,
-                timeframe=TimeFrame(1, TimeFrameUnit.Hour),
+                timeframe=TimeFrame(5, TimeFrameUnit.Minute),  # FIXED: Unified timeframe tracking
                 limit=WARMUP_BARS,
             )
             bars = await loop.run_in_executor(None, self.data.get_crypto_bars, req)
             if symbol not in bars.data:
                 return False
             rows = bars.data[symbol]
-            # Clear and refill — oldest first
+            
             self.closes[symbol].clear()
             self.highs[symbol].clear()
             self.lows[symbol].clear()
@@ -276,10 +248,6 @@ class MeanReversionBot:
         except Exception as e:
             logger.error(f'fetch_bars {symbol}: {e}')
             return False
-
-    # ------------------------------------------------------------------
-    # Account helpers
-    # ------------------------------------------------------------------
 
     def _norm(self, symbol: str) -> str:
         return symbol.replace('/', '').replace('-', '')
@@ -299,7 +267,6 @@ class MeanReversionBot:
             return {}
 
     async def submit_order(self, symbol: str, side: str, qty: float):
-        """Submit market order. Returns (success, fill_qty, fill_price)."""
         try:
             loop = asyncio.get_running_loop()
             norm = self._norm(symbol)
@@ -315,7 +282,6 @@ class MeanReversionBot:
             )
             order = await loop.run_in_executor(None, self.trading.submit_order, req)
 
-            # Wait briefly for fill price to populate
             await asyncio.sleep(2)
             try:
                 loop2    = asyncio.get_running_loop()
@@ -335,12 +301,7 @@ class MeanReversionBot:
             logger.error(f'submit_order {symbol} {side}: {e}')
             return False, 0.0, 0.0
 
-    # ------------------------------------------------------------------
-    # Baseline BTC hold
-    # ------------------------------------------------------------------
-
     async def maintain_baseline(self, portfolio_value: float, btc_price: float):
-        """Keep 30% of portfolio in BTC. Rebalance once per day."""
         today = datetime.now(timezone.utc).date()
         if self.baseline_last_rebal == today:
             return
@@ -355,7 +316,6 @@ class MeanReversionBot:
         current_value    = (positions_cache.get(btc_norm, {}).get('qty', 0.0) * btc_price)
         diff_notional    = target_notional - current_value
 
-        # Only act if deviation > 2% of portfolio
         if abs(diff_notional) < portfolio_value * 0.02:
             logger.info(f'Baseline BTC OK (${current_value:.0f} vs target ${target_notional:.0f})')
             return
@@ -364,10 +324,6 @@ class MeanReversionBot:
         side = 'buy' if qty > 0 else 'sell'
         logger.info(f'BASELINE {side.upper()} BTC {abs(qty):.6f} @ ${btc_price:.2f}')
         await self.submit_order(BTC_SYMBOL, side, abs(qty))
-
-    # ------------------------------------------------------------------
-    # Position management
-    # ------------------------------------------------------------------
 
     async def manage_position(self):
         if not self.position:
@@ -397,7 +353,7 @@ class MeanReversionBot:
         pnl_pct = (price - entry_price) / entry_price * 100
         logger.info(
             f'Tracking {sym} | ${price:.4f} | P&L {pnl_pct:+.2f}% | '
-            f'SL ${stop_price:.4f} | TP ${target_price:.4f} | bars {bars_held}'
+            f'SL ${stop_price:.4f} | TP ${target_price:.4f} | Bars Held: {bars_held}'
         )
 
         if exit_reason:
@@ -423,10 +379,6 @@ class MeanReversionBot:
                     self.global_cooldown = now + timedelta(hours=COOLDOWN_WIN_H)
                     logger.info(f'Short {COOLDOWN_WIN_H}h cooldown ({exit_reason})')
 
-    # ------------------------------------------------------------------
-    # Entry logic
-    # ------------------------------------------------------------------
-
     async def look_for_entry(self, portfolio_value: float, cash: float, positions_cache: dict):
         now = datetime.now(timezone.utc)
         if now < self.global_cooldown:
@@ -434,7 +386,6 @@ class MeanReversionBot:
             logger.info(f'Global cooldown active — {remaining}m remaining')
             return
 
-        # Cash check — need enough for baseline top-up + trade
         btc_norm        = self._norm(BTC_SYMBOL)
         btc_price       = float(self.closes[BTC_SYMBOL][-1]) if self.closes[BTC_SYMBOL] else 0
         baseline_val    = positions_cache.get(btc_norm, {}).get('qty', 0.0) * btc_price
@@ -445,7 +396,6 @@ class MeanReversionBot:
             logger.info(f'Insufficient cash for trade (need ${cash_for_baseline + trade_reserve:.0f}, have ${cash:.0f})')
             return
 
-        # Score all symbols
         candidates = []
         for sym in SYMBOLS:
             if not self.closes[sym] or len(self.closes[sym]) < 50:
@@ -466,7 +416,6 @@ class MeanReversionBot:
             logger.info(f'No entry — best score {best_score:.3f} below threshold {BUY_THRESHOLD}')
             return
 
-        # Regime filter: price above 50-bar SMA
         prices = list(self.closes[best_sym])
         sma50  = calc_sma(prices, 50)
         if best_price <= sma50:
@@ -477,7 +426,6 @@ class MeanReversionBot:
         lows   = list(self.lows[best_sym])
         atr    = calc_atr(highs, lows, prices, 14)
 
-        # Volatility filter
         if atr < best_price * MIN_ATR_PCT:
             logger.info(f'Reject {best_sym} — ATR too low ({atr:.4f})')
             return
@@ -511,25 +459,20 @@ class MeanReversionBot:
                 target_price=target_price,
             )
 
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-
     async def run(self):
         logger.info('=' * 60)
-        logger.info('ALPACA MEAN REVERSION BOT — started')
-        logger.info(f'  Buy threshold : {BUY_THRESHOLD}')
-        logger.info(f'  Stop / Target : ATR×{ATR_STOP_MULT} / ATR×{ATR_TARGET_MULT}')
-        logger.info(f'  Position size : {POSITION_PCT*100:.0f}% of portfolio')
-        logger.info(f'  Baseline BTC  : {BASELINE_PCT*100:.0f}% of portfolio')
-        logger.info(f'  Cycle         : {CYCLE_SECS//60} min')
+        logger.info('ALPACA MEAN REVERSION BOT — STARTED')
+        logger.info(f'  Execution Mode : 5-Minute Bars Unified')
+        logger.info(f'  Buy threshold  : {BUY_THRESHOLD}')
+        logger.info(f'  Stop / Target  : ATR×{ATR_STOP_MULT} / ATR×{ATR_TARGET_MULT}')
+        logger.info(f'  Position size  : {POSITION_PCT*100:.0f}% of portfolio')
+        logger.info(f'  Baseline BTC   : {BASELINE_PCT*100:.0f}% of portfolio')
         logger.info('=' * 60)
 
         last_heartbeat = 0
 
         while True:
             try:
-                # Heartbeat
                 now_t = time.time()
                 if now_t - last_heartbeat >= 60:
                     logger.info(
@@ -538,29 +481,29 @@ class MeanReversionBot:
                     )
                     last_heartbeat = now_t
 
-                # Reset daily counters
                 today = datetime.now(timezone.utc).date()
                 if today != self.current_day:
                     logger.info(f'New day — resetting daily P&L (was ${self.daily_pnl:.2f})')
                     self.daily_pnl   = 0.0
                     self.current_day = today
 
-                # Daily loss guard
                 if self.daily_pnl <= DAILY_LOSS_LIMIT:
                     logger.error(f'Daily loss limit hit (${self.daily_pnl:.2f}) — pausing 1h')
-                    await asyncio.sleep(300)
+                    await asyncio.sleep(3600)
                     continue
 
-                # Wait for next cycle
-                await asyncio.sleep(CYCLE_SECS)
+                # FIXED: Staggered sequential execution to prevent data request pooling timeouts
+                results = []
+                for s in SYMBOLS:
+                    res = await self.fetch_bars(s)
+                    results.append(res)
+                    await asyncio.sleep(1.2)  # Stagger rate-limit window
 
-                # Fetch all bars concurrently
-                results = await asyncio.gather(*[self.fetch_bars(s) for s in SYMBOLS])
                 if not any(results):
                     logger.warning('All data fetches failed — skipping cycle')
+                    await asyncio.sleep(10)
                     continue
 
-                # Account info
                 account = await self.get_account()
                 portfolio_value = float(account.portfolio_value)
                 cash            = float(account.cash)
@@ -568,16 +511,15 @@ class MeanReversionBot:
 
                 btc_price = float(self.closes[BTC_SYMBOL][-1]) if self.closes[BTC_SYMBOL] else 0.0
 
-                # Baseline BTC rebalance (once per day)
                 await self.maintain_baseline(portfolio_value, btc_price)
 
-                # Manage open position or look for entry
                 if self.position:
                     await self.manage_position()
                 else:
                     await self.look_for_entry(portfolio_value, cash, positions_cache)
 
                 self.save_state()
+                await asyncio.sleep(CYCLE_SECS)
 
             except Exception as e:
                 logger.error(f'Top-level error: {e}', exc_info=True)
@@ -587,10 +529,6 @@ class MeanReversionBot:
         self.save_state()
         logger.info(f'Shutdown. Total P&L: ${self.total_pnl:.2f}')
 
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
 
 if __name__ == '__main__':
     bot = MeanReversionBot()
