@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 # CONFIG  — Mirror of QC Tunables (Corrected for 5-Minute Timeframe Consistency)
 # ==============================================================================
 
-BUY_THRESHOLD    = 0.80
+# In your CONFIG section
+BUY_THRESHOLD = 0.60  # Changed from 0.80
 MIN_HOLD_BARS    = 24    # 2 hours on a 5-min chart
 MAX_HOLD_BARS    = 168   # 14 hours on a 5-min chart
 ATR_STOP_MULT    = 1.5
