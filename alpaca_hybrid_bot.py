@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 
 # In your CONFIG section
-BUY_THRESHOLD = 0.60  # Changed from 0.80
+BUY_THRESHOLD = 0.25  # Changed from 0.80
 MIN_HOLD_BARS    = 24    # 2 hours on a 5-min chart
 MAX_HOLD_BARS    = 168   # 14 hours on a 5-min chart
 ATR_STOP_MULT    = 1.5
