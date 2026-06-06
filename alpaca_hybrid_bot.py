@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import asyncio
 import os
@@ -35,22 +34,29 @@ def write_trade_to_db(bot_name, symbol, side, price, qty=0.0, value=0.0, order_i
     except Exception as e:
         logger.error(f"Database write error: {e}")
 
-def log_bot_startup(bot_name):
-    """Signals to database that this specific bot is live."""
+def check_status(bot_name):
+    """Heartbeat and Kill Switch check for the bot_status table."""
     db_url = os.getenv('DATABASE_URL')
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
+                # 1. Update Heartbeat (Upsert)
                 cur.execute('''
-                    INSERT INTO trades (bot_name, exchange, symbol, side, price, quantity, value, order_id, timestamp)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                ''', (bot_name, 'Alpaca', 'N/A', 'SYSTEM', 0.0, 0.0, 0.0, 'STARTUP_SIGNAL'))
+                    INSERT INTO bot_status (bot_name, last_update, status)
+                    VALUES (%s, NOW(), 'RUNNING')
+                    ON CONFLICT (bot_name) 
+                    DO UPDATE SET last_update = NOW(), status = EXCLUDED.status;
+                ''', (bot_name,))
+                
+                # 2. Check for Kill Switch
+                cur.execute("SELECT status FROM bot_status WHERE bot_name = %s", (bot_name,))
+                row = cur.fetchone()
+                if row and row[0] == 'STOP':
+                    logger.warning(f"🛑 Kill switch activated for {bot_name}. Shutting down.")
+                    exit(0)
                 conn.commit()
-        logger.info(f"[{bot_name}] Heartbeat: Logged to DB.")
     except Exception as e:
-        logger.error(f"Startup log failed: {e}")
-
-# ... [Keep your existing calc_rsi, calc_ema, etc. functions here]
+        logger.error(f"Heartbeat failed: {e}")
 
 class MeanReversionBot:
     def __init__(self):
@@ -60,30 +66,30 @@ class MeanReversionBot:
         self.trading = TradingClient(self.api_key, self.secret_key, paper=True)
         self.data = CryptoHistoricalDataClient()
         
-        # Trigger heartbeat on init
-        log_bot_startup(self.bot_name)
-        
+        # Initial status check
+        check_status(self.bot_name)
         logger.info(f'Bot {self.bot_name} initialized.')
 
     async def manage_position(self):
-        # ... (Keep existing logic)
+        # ... (Existing logic)
         if exit_reason:
             success, fill_qty, fill_price = await self.submit_order(sym, 'sell', qty)
             if success:
-                # Update DB: Using fill_price * fill_qty for the 'value' column
                 write_trade_to_db(self.bot_name, sym, 'SELL', fill_price, fill_qty, (fill_price * fill_qty), 'MANUAL_EXIT')
                 self.position = {}
 
     async def look_for_entry(self, portfolio_value, cash, positions_cache):
-        # ... (Keep existing logic)
+        # ... (Existing logic)
         success, fill_qty, fill_price = await self.submit_order(best_sym, 'buy', qty)
         if success:
-            # Update DB:
             write_trade_to_db(self.bot_name, best_sym, 'BUY', fill_price, fill_qty, (fill_price * fill_qty), 'ENTRY_SIGNAL')
 
     async def run(self):
         while True:
-            # ... (Keep existing loop)
+            # Heartbeat & Kill Switch check at the start of every loop
+            check_status(self.bot_name)
+            
+            # ... (Existing loop logic)
             await asyncio.sleep(300)
 
 if __name__ == '__main__':
