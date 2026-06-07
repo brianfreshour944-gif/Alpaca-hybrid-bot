@@ -77,11 +77,11 @@ class MeanReversionBot:
             
         self.trading = TradingClient(api_key, api_secret, paper=True)
         # Attempt status check, but handle failure gracefully
-        try:
-            from __main__ import check_status
-            check_status(self.bot_name)
-        except Exception as e:
-            logger.warning(f"Status check skipped or failed: {e}")
+       # Just call the function directly since it's in the same script
+try:
+    check_status(self.bot_name)
+except Exception as e:
+    logger.warning(f"Status check skipped or failed: {e}")
 
     async def sync_orders(self):
         try:
