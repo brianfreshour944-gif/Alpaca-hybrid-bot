@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Alpaca Hybrid Bot – Robust Mean Reversion
+Alpaca Hybrid Bot – Mean Reversion with Bollinger Bands
 Bot name: alpaca_hybrid_bot (or set via BOT_NAME env var)
 Logs to terminal AND database, never crashes silently.
 """
@@ -10,10 +10,15 @@ import os
 import logging
 import psycopg2
 import sys
-from datetime import datetime
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -45,7 +50,6 @@ def ensure_db_tables():
         return
     try:
         with conn.cursor() as cur:
-            # trades table with fee column
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id SERIAL PRIMARY KEY,
@@ -61,7 +65,6 @@ def ensure_db_tables():
                     timestamp TIMESTAMP DEFAULT NOW()
                 )
             """)
-            # bot_orders table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_orders (
                     order_id TEXT PRIMARY KEY,
@@ -73,7 +76,6 @@ def ensure_db_tables():
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
-            # bot_errors table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_errors (
                     id SERIAL PRIMARY KEY,
@@ -82,7 +84,6 @@ def ensure_db_tables():
                     timestamp TIMESTAMP DEFAULT NOW()
                 )
             """)
-            # bot_status table (kill switch)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_status (
                     bot_name TEXT PRIMARY KEY,
@@ -93,7 +94,6 @@ def ensure_db_tables():
                     config TEXT DEFAULT '{}'
                 )
             """)
-            # Add fee column if missing (for existing tables)
             cur.execute("""
                 DO $$ 
                 BEGIN 
@@ -163,7 +163,6 @@ def check_status(bot_name):
         return
     try:
         with conn.cursor() as cur:
-            # Update heartbeat
             cur.execute("""
                 INSERT INTO bot_status (bot_name, status, last_update)
                 VALUES (%s, 'RUNNING', NOW())
@@ -171,7 +170,6 @@ def check_status(bot_name):
                 SET last_update = NOW(), status = EXCLUDED.status
             """, (bot_name,))
             conn.commit()
-            # Check kill switch
             cur.execute("SELECT status FROM bot_status WHERE bot_name = %s", (bot_name,))
             row = cur.fetchone()
             if row and row[0] == 'STOP':
@@ -186,14 +184,22 @@ def check_status(bot_name):
 class MeanReversionBot:
     def __init__(self):
         self.bot_name = os.getenv('BOT_NAME', 'alpaca_hybrid_bot')
+        self.symbol = "BTC/USD"               # Change to any crypto pair
+        self.trade_size_usd = 50.0            # $50 per trade
+        self.in_position = False
+        self.entry_price = 0.0
+        self.stop_loss_pct = 0.95             # 5% stop loss
+        self.cooldown_until = 0.0
+
         api_key = os.getenv('APCA_API_KEY_ID')
         api_secret = os.getenv('APCA_API_SECRET_KEY')
         if not api_key or not api_secret:
             logger.critical("Missing Alpaca API credentials. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY")
             sys.exit(1)
         self.trading = TradingClient(api_key, api_secret, paper=True)
-        logger.info(f"Bot '{self.bot_name}' initialized (paper trading)")
-        
+        self.data_client = CryptoHistoricalDataClient()
+        logger.info(f"Bot '{self.bot_name}' initialized (paper trading) – trading {self.symbol}")
+
         # Initial health check
         check_status(self.bot_name)
 
@@ -209,7 +215,7 @@ class MeanReversionBot:
                 )
             )
             register_order_in_db(self.bot_name, order.id, symbol, side.value, 0.0)
-            logger.info(f"Placed {side.value} order for {qty} {symbol} (ID: {order.id})")
+            logger.info(f"Placed {side.value} order for {qty:.8f} {symbol} (ID: {order.id})")
             return order
         except Exception as e:
             log_error_to_db(self.bot_name, f"Order placement failed: {e}")
@@ -232,7 +238,9 @@ class MeanReversionBot:
                         alpaca_order = self.trading.get_order_by_id(order_id)
                         if alpaca_order.status == 'filled':
                             cur.execute("UPDATE bot_orders SET status = 'CLOSED' WHERE order_id = %s", (order_id,))
-                            # Alpaca does not return fee in the order object easily; set to 0 for now.
+                            # Update position flag if it was a sell order
+                            if alpaca_order.side == OrderSide.SELL:
+                                self.in_position = False
                             write_trade_to_db(
                                 self.bot_name, symbol,
                                 alpaca_order.side.value,
@@ -250,13 +258,79 @@ class MeanReversionBot:
         finally:
             conn.close()
 
-    # ----- YOUR MEAN REVERSION LOGIC GOES HERE -----
+    async def get_bollinger_bands(self):
+        """
+        Fetch recent 5-minute candles, compute SMA20 and ±2 standard deviation bands.
+        Returns (current_price, lower_band, middle_band, upper_band) or (None, None, None, None)
+        """
+        end = datetime.now()
+        start = end - timedelta(hours=6)   # enough for ~72 5-min bars
+        request = CryptoBarsRequest(
+            symbol_or_symbols=self.symbol,
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            limit=500
+        )
+        bars = self.data_client.get_crypto_bars(request).data.get(self.symbol, [])
+        if len(bars) < 30:
+            logger.warning(f"Insufficient minute bars: {len(bars)}")
+            return None, None, None, None
+
+        # Convert to DataFrame, resample to 5 minutes
+        df = pd.DataFrame([{
+            'timestamp': b.timestamp,
+            'close': float(b.close)
+        } for b in bars])
+        df.sort_values('timestamp', inplace=True)
+        df.set_index('timestamp', inplace=True)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        ohlc_5 = df.resample('5min').agg({'close': 'last'}).dropna()
+        closes = ohlc_5['close'].values
+        if len(closes) < 20:
+            logger.warning(f"Not enough 5-min bars: {len(closes)}")
+            return None, None, None, None
+
+        # Calculate Bollinger Bands (20 period, 2 std)
+        sma = pd.Series(closes).rolling(20).mean().iloc[-1]
+        std = pd.Series(closes).rolling(20).std().iloc[-1]
+        lower = sma - 2 * std
+        upper = sma + 2 * std
+        current_price = closes[-1]
+        return current_price, lower, sma, upper
+
     async def check_for_signals(self):
         """
-        Replace with your actual strategy.
-        Return (symbol, side, qty) or None.
-        For now, it does nothing (no orders placed).
+        Mean reversion logic using Bollinger Bands.
+        Returns (symbol, side, qty) or None.
         """
+        # Cooldown after a sell
+        if time.time() < self.cooldown_until:
+            logger.debug("Cooldown active")
+            return None
+
+        current_price, lower, middle, upper = await self.get_bollinger_bands()
+        if current_price is None:
+            return None
+
+        logger.info(f"Price: {current_price:.2f} | Lower: {lower:.2f} | Middle: {middle:.2f} | Upper: {upper:.2f} | In position: {self.in_position}")
+
+        if not self.in_position:
+            # Buy signal: price below lower band (oversold)
+            if current_price < lower:
+                qty = self.trade_size_usd / current_price
+                logger.info(f"*** BUY SIGNAL – price {current_price:.2f} below lower band {lower:.2f} ***")
+                return (self.symbol, OrderSide.BUY, qty)
+        else:
+            # Exit conditions: price returned above middle band OR stop loss hit
+            if current_price > middle:
+                logger.info(f"*** SELL SIGNAL – price reverted above middle band {middle:.2f} ***")
+                return (self.symbol, OrderSide.SELL, None)   # qty will be fetched from position
+            elif current_price <= self.entry_price * self.stop_loss_pct:
+                logger.info(f"*** STOP LOSS TRIGGERED at {current_price:.2f} (entry {self.entry_price:.2f}) ***")
+                return (self.symbol, OrderSide.SELL, None)
         return None
 
     async def run(self):
@@ -268,17 +342,39 @@ class MeanReversionBot:
                 # 1. Kill switch check
                 check_status(self.bot_name)
 
-                # 2. Sync filled orders
+                # 2. Sync filled orders (update in_position flag)
                 await self.sync_orders()
 
-                # 3. Strategy signal (placeholder)
+                # 3. Get trading signal
                 signal = await self.check_for_signals()
                 if signal:
                     symbol, side, qty = signal
-                    self.place_order_tracked(symbol, side, qty)
+                    if side == OrderSide.SELL:
+                        # Need to fetch current position size
+                        try:
+                            position = self.trading.get_position(symbol)
+                            qty = float(position.qty)
+                        except Exception:
+                            logger.warning(f"No position to sell for {symbol}")
+                            self.in_position = False
+                            qty = 0.0
+                        if qty > 0:
+                            order = self.place_order_tracked(symbol, side, qty)
+                            if order:
+                                self.in_position = False
+                                self.cooldown_until = time.time() + 900   # 15 min cooldown
+                    else:  # BUY
+                        order = self.place_order_tracked(symbol, side, qty)
+                        if order:
+                            self.in_position = True
+                            self.entry_price = symbol   # Not used; we'll fetch from fill later
+                            # Actually we should fetch the filled price after order fill
+                            # For simplicity, we'll use the current price as approximation
+                            self.entry_price = (await self.get_bollinger_bands())[0]
+                            logger.info(f"Position opened, entry price approx {self.entry_price:.2f}")
 
                 # 4. Loop interval
-                await asyncio.sleep(60)  # adjust as needed
+                await asyncio.sleep(60)  # check every minute
 
             except Exception as e:
                 log_error_to_db(self.bot_name, f"Main loop error: {e}")
@@ -286,7 +382,7 @@ class MeanReversionBot:
 
 # ---------- MAIN ----------
 if __name__ == "__main__":
-    # Ensure DB tables exist before starting
+    import time  # for cooldown
     ensure_db_tables()
     bot = MeanReversionBot()
     asyncio.run(bot.run())
