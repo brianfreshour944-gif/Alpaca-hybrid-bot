@@ -10,6 +10,7 @@ import os
 import logging
 import psycopg2
 import sys
+import time
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -206,12 +207,13 @@ class MeanReversionBot:
     def place_order_tracked(self, symbol, side, qty):
         """Place a market order and track it in DB."""
         try:
+            # FIX: Use GTC for crypto orders (DAY is not allowed)
             order = self.trading.submit_order(
                 MarketOrderRequest(
                     symbol=symbol,
                     qty=qty,
                     side=side,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.GTC   # <--- CRITICAL FIX
                 )
             )
             register_order_in_db(self.bot_name, order.id, symbol, side.value, 0.0)
@@ -352,7 +354,9 @@ class MeanReversionBot:
                     if side == OrderSide.SELL:
                         # Need to fetch current position size
                         try:
-                            position = self.trading.get_position(symbol)
+                            # Note: Alpaca requires symbol without slash for get_position
+                            pos_symbol = symbol.replace("/", "")
+                            position = self.trading.get_position(pos_symbol)
                             qty = float(position.qty)
                         except Exception:
                             logger.warning(f"No position to sell for {symbol}")
@@ -367,11 +371,19 @@ class MeanReversionBot:
                         order = self.place_order_tracked(symbol, side, qty)
                         if order:
                             self.in_position = True
-                            self.entry_price = symbol   # Not used; we'll fetch from fill later
-                            # Actually we should fetch the filled price after order fill
-                            # For simplicity, we'll use the current price as approximation
-                            self.entry_price = (await self.get_bollinger_bands())[0]
-                            logger.info(f"Position opened, entry price approx {self.entry_price:.2f}")
+                            # Wait a moment for the order to fill, then get the actual fill price
+                            await asyncio.sleep(2)
+                            try:
+                                # Fetch the order again to get filled price
+                                filled_order = self.trading.get_order_by_id(order.id)
+                                if filled_order.filled_avg_price:
+                                    self.entry_price = float(filled_order.filled_avg_price)
+                                else:
+                                    # Fallback to current price
+                                    self.entry_price = (await self.get_bollinger_bands())[0]
+                            except:
+                                self.entry_price = (await self.get_bollinger_bands())[0]
+                            logger.info(f"Position opened, entry price ${self.entry_price:.2f}")
 
                 # 4. Loop interval
                 await asyncio.sleep(60)  # check every minute
