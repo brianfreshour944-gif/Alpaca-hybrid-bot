@@ -322,7 +322,7 @@ class MeanReversionBot:
         if not self.in_position:
             # Buy signal: price below lower band (oversold)
             # --- IMPROVED CODE ---
-if current_price < lower:
+        if current_price < lower:
     # Ensure the order value is at least $10.01 to satisfy Alpaca's minimum
     min_order_value = 10.01
     actual_order_value = max(self.trade_size_usd, min_order_value)
