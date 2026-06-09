@@ -321,10 +321,16 @@ class MeanReversionBot:
 
         if not self.in_position:
             # Buy signal: price below lower band (oversold)
-            if current_price < lower:
-                qty = self.trade_size_usd / current_price
-                logger.info(f"*** BUY SIGNAL – price {current_price:.2f} below lower band {lower:.2f} ***")
-                return (self.symbol, OrderSide.BUY, qty)
+            # --- IMPROVED CODE ---
+if current_price < lower:
+    # Ensure the order value is at least $10.01 to satisfy Alpaca's minimum
+    min_order_value = 10.01
+    actual_order_value = max(self.trade_size_usd, min_order_value)
+    
+    qty = actual_order_value / current_price
+    logger.info(f"*** BUY SIGNAL – price {current_price:.2f} below lower band {lower:.2f} ***")
+    logger.info(f"Submitting buy order for ${actual_order_value:.2f} worth of {self.symbol}")
+    return (self.symbol, OrderSide.BUY, qty)
         else:
             # Exit conditions: price returned above middle band OR stop loss hit
             if current_price > middle:
