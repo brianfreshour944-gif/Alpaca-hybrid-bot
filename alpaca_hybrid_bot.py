@@ -185,11 +185,11 @@ def check_status(bot_name):
 class MeanReversionBot:
     def __init__(self):
         self.bot_name = os.getenv('BOT_NAME', 'alpaca_hybrid_bot')
-        self.symbol = "BTC/USD"               # Change to any crypto pair
-        self.trade_size_usd = 50.0            # $50 per trade
+        self.symbol = "BTC/USD"
+        self.trade_size_usd = 50.0
         self.in_position = False
         self.entry_price = 0.0
-        self.stop_loss_pct = 0.95             # 5% stop loss
+        self.stop_loss_pct = 0.95
         self.cooldown_until = 0.0
 
         api_key = os.getenv('APCA_API_KEY_ID')
@@ -201,19 +201,17 @@ class MeanReversionBot:
         self.data_client = CryptoHistoricalDataClient()
         logger.info(f"Bot '{self.bot_name}' initialized (paper trading) – trading {self.symbol}")
 
-        # Initial health check
         check_status(self.bot_name)
 
     def place_order_tracked(self, symbol, side, qty):
         """Place a market order and track it in DB."""
         try:
-            # FIX: Use GTC for crypto orders (DAY is not allowed)
             order = self.trading.submit_order(
                 MarketOrderRequest(
                     symbol=symbol,
                     qty=qty,
                     side=side,
-                    time_in_force=TimeInForce.GTC   # <--- CRITICAL FIX
+                    time_in_force=TimeInForce.GTC
                 )
             )
             register_order_in_db(self.bot_name, order.id, symbol, side.value, 0.0)
@@ -240,7 +238,6 @@ class MeanReversionBot:
                         alpaca_order = self.trading.get_order_by_id(order_id)
                         if alpaca_order.status == 'filled':
                             cur.execute("UPDATE bot_orders SET status = 'CLOSED' WHERE order_id = %s", (order_id,))
-                            # Update position flag if it was a sell order
                             if alpaca_order.side == OrderSide.SELL:
                                 self.in_position = False
                             write_trade_to_db(
@@ -261,12 +258,8 @@ class MeanReversionBot:
             conn.close()
 
     async def get_bollinger_bands(self):
-        """
-        Fetch recent 5-minute candles, compute SMA20 and ±2 standard deviation bands.
-        Returns (current_price, lower_band, middle_band, upper_band) or (None, None, None, None)
-        """
         end = datetime.now()
-        start = end - timedelta(hours=6)   # enough for ~72 5-min bars
+        start = end - timedelta(hours=6)
         request = CryptoBarsRequest(
             symbol_or_symbols=self.symbol,
             timeframe=TimeFrame.Minute,
@@ -279,7 +272,6 @@ class MeanReversionBot:
             logger.warning(f"Insufficient minute bars: {len(bars)}")
             return None, None, None, None
 
-        # Convert to DataFrame, resample to 5 minutes
         df = pd.DataFrame([{
             'timestamp': b.timestamp,
             'close': float(b.close)
@@ -295,7 +287,6 @@ class MeanReversionBot:
             logger.warning(f"Not enough 5-min bars: {len(closes)}")
             return None, None, None, None
 
-        # Calculate Bollinger Bands (20 period, 2 std)
         sma = pd.Series(closes).rolling(20).mean().iloc[-1]
         std = pd.Series(closes).rolling(20).std().iloc[-1]
         lower = sma - 2 * std
@@ -308,7 +299,6 @@ class MeanReversionBot:
         Mean reversion logic using Bollinger Bands.
         Returns (symbol, side, qty) or None.
         """
-        # Cooldown after a sell
         if time.time() < self.cooldown_until:
             logger.debug("Cooldown active")
             return None
@@ -321,21 +311,20 @@ class MeanReversionBot:
 
         if not self.in_position:
             # Buy signal: price below lower band (oversold)
-            # --- IMPROVED CODE ---
-        if current_price < lower:
-    # Ensure the order value is at least $10.01 to satisfy Alpaca's minimum
-    min_order_value = 10.01
-    actual_order_value = max(self.trade_size_usd, min_order_value)
-    
-    qty = actual_order_value / current_price
-    logger.info(f"*** BUY SIGNAL – price {current_price:.2f} below lower band {lower:.2f} ***")
-    logger.info(f"Submitting buy order for ${actual_order_value:.2f} worth of {self.symbol}")
-    return (self.symbol, OrderSide.BUY, qty)
+            if current_price < lower:
+                # Ensure the order value is at least $10.01 to satisfy Alpaca's minimum
+                min_order_value = 10.01
+                actual_order_value = max(self.trade_size_usd, min_order_value)
+                
+                qty = actual_order_value / current_price
+                logger.info(f"*** BUY SIGNAL – price {current_price:.2f} below lower band {lower:.2f} ***")
+                logger.info(f"Submitting buy order for ${actual_order_value:.2f} worth of {self.symbol}")
+                return (self.symbol, OrderSide.BUY, qty)
         else:
             # Exit conditions: price returned above middle band OR stop loss hit
             if current_price > middle:
                 logger.info(f"*** SELL SIGNAL – price reverted above middle band {middle:.2f} ***")
-                return (self.symbol, OrderSide.SELL, None)   # qty will be fetched from position
+                return (self.symbol, OrderSide.SELL, None)
             elif current_price <= self.entry_price * self.stop_loss_pct:
                 logger.info(f"*** STOP LOSS TRIGGERED at {current_price:.2f} (entry {self.entry_price:.2f}) ***")
                 return (self.symbol, OrderSide.SELL, None)
@@ -347,20 +336,13 @@ class MeanReversionBot:
 
         while True:
             try:
-                # 1. Kill switch check
                 check_status(self.bot_name)
-
-                # 2. Sync filled orders (update in_position flag)
                 await self.sync_orders()
-
-                # 3. Get trading signal
                 signal = await self.check_for_signals()
                 if signal:
                     symbol, side, qty = signal
                     if side == OrderSide.SELL:
-                        # Need to fetch current position size
                         try:
-                            # Note: Alpaca requires symbol without slash for get_position
                             pos_symbol = symbol.replace("/", "")
                             position = self.trading.get_position(pos_symbol)
                             qty = float(position.qty)
@@ -372,35 +354,28 @@ class MeanReversionBot:
                             order = self.place_order_tracked(symbol, side, qty)
                             if order:
                                 self.in_position = False
-                                self.cooldown_until = time.time() + 900   # 15 min cooldown
+                                self.cooldown_until = time.time() + 900
                     else:  # BUY
                         order = self.place_order_tracked(symbol, side, qty)
                         if order:
                             self.in_position = True
-                            # Wait a moment for the order to fill, then get the actual fill price
                             await asyncio.sleep(2)
                             try:
-                                # Fetch the order again to get filled price
                                 filled_order = self.trading.get_order_by_id(order.id)
                                 if filled_order.filled_avg_price:
                                     self.entry_price = float(filled_order.filled_avg_price)
                                 else:
-                                    # Fallback to current price
                                     self.entry_price = (await self.get_bollinger_bands())[0]
                             except:
                                 self.entry_price = (await self.get_bollinger_bands())[0]
                             logger.info(f"Position opened, entry price ${self.entry_price:.2f}")
 
-                # 4. Loop interval
-                await asyncio.sleep(60)  # check every minute
-
+                await asyncio.sleep(60)
             except Exception as e:
                 log_error_to_db(self.bot_name, f"Main loop error: {e}")
                 await asyncio.sleep(30)
 
-# ---------- MAIN ----------
 if __name__ == "__main__":
-    import time  # for cooldown
     ensure_db_tables()
     bot = MeanReversionBot()
     asyncio.run(bot.run())
