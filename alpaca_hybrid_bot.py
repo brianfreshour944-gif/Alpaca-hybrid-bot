@@ -341,20 +341,24 @@ class MeanReversionBot:
                 signal = await self.check_for_signals()
                 if signal:
                     symbol, side, qty = signal
-                    if side == OrderSide.SELL:
-                        try:
-                            pos_symbol = symbol.replace("/", "")
-                            position = self.trading.get_position(pos_symbol)
-                            qty = float(position.qty)
-                        except Exception:
-                            logger.warning(f"No position to sell for {symbol}")
-                            self.in_position = False
-                            qty = 0.0
-                        if qty > 0:
-                            order = self.place_order_tracked(symbol, side, qty)
-                            if order:
-                                self.in_position = False
-                                self.cooldown_until = time.time() + 900
+                    # Replace the sell block in your run() method with this:
+if side == OrderSide.SELL:
+    try:
+        pos_symbol = symbol.replace("/", "")
+        position = self.trading.get_position(pos_symbol)
+        qty = float(position.qty)
+        logger.info(f"Position found: {qty} {symbol}")
+    except Exception as e:
+        # Instead of immediately quitting, log a warning and skip this iteration
+        # to allow the next loop (60 seconds later) to try again.
+        logger.warning(f"Could not fetch position for {symbol}: {e}. Retrying next cycle.")
+        continue # Skip this signal for now to prevent selling 0 qty
+        
+    if qty > 0:
+        order = self.place_order_tracked(symbol, side, qty)
+        if order:
+            self.in_position = False
+            self.cooldown_until = time.time() + 900
                     else:  # BUY
                         order = self.place_order_tracked(symbol, side, qty)
                         if order:
