@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Alpaca Hybrid Bot – Mean Reversion with Bollinger Bands
@@ -67,9 +68,14 @@ def ensure_db_tables():
                     bot_name TEXT PRIMARY KEY, status TEXT DEFAULT 'RUNNING',
                     last_update TIMESTAMP DEFAULT NOW(),
                     daily_loss REAL DEFAULT 0, daily_loss_limit REAL DEFAULT 100,
-                    in_position BOOLEAN DEFAULT FALSE,
-                    entry_price REAL DEFAULT 0,
                     config TEXT DEFAULT '{}')""")
+            # Safely add new columns to existing bot_status table
+            cur.execute("""
+                ALTER TABLE bot_status
+                    ADD COLUMN IF NOT EXISTS in_position BOOLEAN DEFAULT FALSE""")
+            cur.execute("""
+                ALTER TABLE bot_status
+                    ADD COLUMN IF NOT EXISTS entry_price REAL DEFAULT 0""")
             conn.commit()
     finally:
         conn.close()
@@ -124,11 +130,20 @@ def save_position_state(bot_name, in_position, entry_price):
         conn.close()
 
 def load_position_state(bot_name):
-    """Restore position state from DB on restart."""
+    """Restore position state from DB on restart.
+    Also ensures the required columns exist — safe to call before ensure_db_tables."""
     conn = get_db_connection()
     if not conn: return False, 0.0
     try:
         with conn.cursor() as cur:
+            # Guarantee columns exist regardless of call order
+            cur.execute("""
+                ALTER TABLE bot_status
+                    ADD COLUMN IF NOT EXISTS in_position BOOLEAN DEFAULT FALSE""")
+            cur.execute("""
+                ALTER TABLE bot_status
+                    ADD COLUMN IF NOT EXISTS entry_price REAL DEFAULT 0""")
+            conn.commit()
             cur.execute(
                 "SELECT in_position, entry_price FROM bot_status WHERE bot_name = %s",
                 (bot_name,))
@@ -136,6 +151,9 @@ def load_position_state(bot_name):
             if row:
                 return bool(row[0]), float(row[1] or 0.0)
             return False, 0.0
+    except Exception as e:
+        logger.error(f"load_position_state error: {e}")
+        return False, 0.0
     finally:
         conn.close()
 
@@ -200,7 +218,7 @@ class MeanReversionBot:
     def _get_position_qty(self) -> float:
         """
         Robustly fetch BTC position qty from Alpaca.
-        Tries both 'BTCUSD' and 'BTC/USD' symbol formats.
+        Tries multiple symbol formats, falls back to scanning all positions.
         Returns 0.0 if no position found.
         """
         for sym in ["BTCUSD", "BTC/USD", "BTC"]:
@@ -258,7 +276,7 @@ class MeanReversionBot:
                             cur.execute(
                                 "UPDATE bot_orders SET status = 'CLOSED' "
                                 "WHERE order_id = %s", (order_id,))
-                            side_val = alpaca_order.side.value
+                            side_val  = alpaca_order.side.value
                             avg_price = float(alpaca_order.filled_avg_price or 0)
                             filled_qty = float(alpaca_order.filled_qty or 0)
                             write_trade_to_db(
@@ -319,7 +337,6 @@ class MeanReversionBot:
         )
 
         if not self.in_position:
-            # BUY: price touches or breaks below lower band
             if price < lower:
                 qty = max(self.trade_size_usd, 10.01) / price
                 logger.info(
@@ -327,10 +344,9 @@ class MeanReversionBot:
                 return (self.symbol, OrderSide.BUY, qty)
 
         else:
-            stop_hit     = price <= self.entry_price * self.stop_loss_pct
-            # FIX: exit on upper band touch, not middle — gives trade room to breathe
-            target_hit   = price >= upper
-            manual_exit  = price >= middle and (price - middle) > (upper - middle) * 0.5
+            stop_hit    = price <= self.entry_price * self.stop_loss_pct
+            target_hit  = price >= upper
+            manual_exit = price >= middle and (price - middle) > (upper - middle) * 0.5
 
             if stop_hit:
                 logger.info(
@@ -360,7 +376,6 @@ class MeanReversionBot:
                     symbol, side, qty = signal
 
                     if side == OrderSide.SELL:
-                        # Robust position lookup before selling
                         qty_to_sell = self._get_position_qty()
                         if qty_to_sell == 0.0:
                             logger.warning(
@@ -371,8 +386,7 @@ class MeanReversionBot:
                             self.entry_price = 0.0
                             save_position_state(self.bot_name, False, 0.0)
                         else:
-                            order = self.place_order_tracked(
-                                symbol, side, qty_to_sell)
+                            order = self.place_order_tracked(symbol, side, qty_to_sell)
                             if order:
                                 logger.info(
                                     f"✅ SELL order placed | "
@@ -389,8 +403,7 @@ class MeanReversionBot:
                             price_now = (await self.get_bollinger_bands())[0]
                             self.in_position = True
                             self.entry_price = price_now or 0.0
-                            save_position_state(
-                                self.bot_name, True, self.entry_price)
+                            save_position_state(self.bot_name, True, self.entry_price)
                             logger.info(
                                 f"✅ BUY order placed | qty={qty:.6f} | "
                                 f"entry={self.entry_price:.2f} | "
