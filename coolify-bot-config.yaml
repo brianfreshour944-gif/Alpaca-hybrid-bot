@@ -1,0 +1,91 @@
+# Coolify Configuration for Apex Oracle Trading Bot
+# This configuration sets up the trading bot with all required services
+
+version: '3.8'
+
+services:
+  # Main Trading Bot Service
+  trading-bot:
+    image: python:3.11-slim
+    container_name: apex-oracle-bot
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      - AI_KEY=${AI_KEY}
+      - AI_MODEL=${AI_MODEL:-llama-3.1-70b-versatile}
+      - OKX_API_KEY=${OKX_API_KEY}
+      - OKX_SECRET_KEY=${OKX_SECRET_KEY}
+      - OKX_PASSPHRASE=${OKX_PASSPHRASE}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////app/data/trades.db}
+      - BOT_NAME=${BOT_NAME:-apex_oracle_bot}
+      - OKX_USE_DEMO=${OKX_USE_DEMO:-true}
+    command: >
+      bash -c "pip install -r Apex_oracle_bot/requirements.txt &&
+      cd Apex_oracle_bot &&
+      python bot.py"
+    ports:
+      - "8080:8080"  # Status endpoint
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional: PostgreSQL Database (uncomment if needed)
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: trading-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     - POSTGRES_USER=${POSTGRES_USER:-trading}
+  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-trading123}
+  #     - POSTGRES_DB=${POSTGRES_DB:-trading_db}
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U trading"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+
+# Volumes for persistent data
+volumes:
+  postgres_data:
+
+# Coolify-specific configuration
+coolify:
+  build:
+    - "pip install -r Apex_oracle_bot/requirements.txt"
+  start:
+    - "cd Apex_oracle_bot && python bot.py"
+  environment:
+    - AI_KEY
+    - OKX_API_KEY
+    - OKX_SECRET_KEY
+    - OKX_PASSPHRASE
+    - DATABASE_URL
+  healthcheck:
+    endpoint: "/status"
+    interval: 30
+    timeout: 10
+    retries: 3
+
+# Deployment configuration
+deploy:
+  strategy: rolling
+  max_surge: 1
+  max_unavailable: 0
+  timeout: 600
+
+# Resource limits
+resources:
+  trading-bot:
+    cpu: 1.0
+    memory: 1024Mi
+  # postgres:
+  #   cpu: 0.5
+  #   memory: 512Mi
