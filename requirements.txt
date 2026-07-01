@@ -1,1 +1,5 @@
-requests==2.34.2\nccxt==1.50.0
+alpaca-py>=0.20.0
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv
+psycopg2-binary
