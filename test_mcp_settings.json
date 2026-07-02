@@ -1,0 +1,7 @@
+{
+  "server_url": "http://localhost:8765",
+  "secret_key": " 1|pw4uvV1q0k1ihnZMMdsY1VY4vPjzmFXeeZAQ0nrDda5a2c3a",
+  "timeout": 60,
+  "max_retries": 5,
+  "enable_logging": true
+}
