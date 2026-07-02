@@ -322,7 +322,8 @@ class MeanReversionBot:
 
         api_key    = os.getenv('APCA_API_KEY_ID')
         api_secret = os.getenv('APCA_API_SECRET_KEY')
-        self.trading     = TradingClient(api_key, api_secret, paper=True)
+        # alpaca-py explicitly requires 'secret_key' keyword argument if passed positionally or named
+        self.trading     = TradingClient(api_key=api_key, secret_key=api_secret, paper=True)
         self.data_client = CryptoHistoricalDataClient()
 
         # Restore position state from DB on startup
